@@ -10,14 +10,14 @@
         <version>1.0.0</version>
     </parent>
 
-    <artifactId>parking-lot</artifactId>
+    <artifactId>coffee-vending-machine</artifactId>
     <packaging>jar</packaging>
 
-    <name>Parking Lot System</name>
-    <description>Low Level Design - Parking Lot Management System</description>
+    <name>Coffee Vending Machine</name>
+    <description>Low Level Design - Coffee Vending Machine System</description>
 
     <properties>
-        <main.class>com.parkinglot.ParkingLotDemo</main.class>
+        <main.class>com.coffeevendingmachine.CoffeeVendingMachineDemo</main.class>
     </properties>
 
     <build>

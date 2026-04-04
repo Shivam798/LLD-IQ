@@ -22,34 +22,34 @@ User interacts with machine
     │
     ▼
 [ReadyState] ── selectCoffee(type, toppings) ──────────────────────────┐
-    │                                                                   │
+    │                                                                  │
     │   1. CoffeeFactory.createCoffee(type)         ← Factory Pattern  │
-    │   2. Wrap with Decorator(s) for toppings       ← Decorator Pattern│
-    │   3. machine.setSelectedCoffee(wrappedCoffee)                     │
-    │                                                                   │
-    ▼                                                                   │
-[SelectingState] ── insertMoney(amount) ────────────────────────────────┤
-    │                                                                   │
-    │   Accumulate money. If total >= price → transition to PaidState   │
-    │                                                                   │
-    ▼                                                                   │
-[PaidState] ── dispenseCoffee() ────────────────────────────────────────┤
-    │                                                                   │
-    │   1. Check Inventory.hasIngredients(recipe)                       │
+    │   2. Wrap with Decorator(s) for toppings      ← Decorator Pattern│
+    │   3. machine.setSelectedCoffee(wrappedCoffee)                    │
+    │                                                                  │
+    ▼                                                                  │
+[SelectingState] ── insertMoney(amount) ───────────────────────────────┤
+    │                                                                  │
+    │   Accumulate money. If total >= price → transition to PaidState  │
+    │                                                                  │
+    ▼                                                                  │
+[PaidState] ── dispenseCoffee() ───────────────────────────────────────┤
+    │                                                                  │
+    │   1. Check Inventory.hasIngredients(recipe)                      │
     │      ├── NO  → OutOfIngredientState → refund → ReadyState        │
-    │      └── YES → deductIngredients(recipe)                          │
-    │                                                                   │
-    │   2. coffee.prepare()                          ← Template Method  │
-    │      ├── grindBeans()                                             │
-    │      ├── brew()                                                   │
+    │      └── YES → deductIngredients(recipe)                         │
+    │                                                                  │
+    │   2. coffee.prepare()                          ← Template Method │
+    │      ├── grindBeans()                                            │
+    │      ├── brew()                                                  │
     │      ├── addCondiments()   ← hook (milk, foam, etc.)             │
-    │      └── pourIntoCup()                                            │
-    │                                                                   │
-    │   3. Return change if overpaid                                    │
-    │   4. Reset → ReadyState                                           │
-    │                                                                   │
-    ▼                                                                   │
-[ReadyState] ── waiting for next customer ──────────────────────────────┘
+    │      └── pourIntoCup()                                           │
+    │                                                                  │
+    │   3. Return change if overpaid                                   │
+    │   4. Reset → ReadyState                                          │
+    │                                                                  │
+    ▼                                                                  │
+[ReadyState] ── waiting for next customer ─────────────────────────────┘
 
     At any point during Selecting/Paid:
         cancel() → refund money → reset → ReadyState
@@ -59,8 +59,185 @@ User interacts with machine
 
 ## Class Diagram
 
-https://excalidraw.com/#json=uj5zCSCWJ4asMLDvOgOTI,7i9s77kbz4HcFx_i7orHjg
+> **Interactive:** Open [`class-diagram.excalidraw`](class-diagram.excalidraw) at [excalidraw.com](https://excalidraw.com) (File → Open) for the full interactive diagram with colors and layout.
+
 ![img.png](src/main/resources/img.png)
+<details>
+<summary>Mermaid Class Diagram (click to expand)</summary>
+
+```mermaid
+classDiagram
+    direction TB
+
+    class CoffeeType {
+        <<enum>>
+        ESPRESSO
+        LATTE
+        CAPPUCCINO
+    }
+
+    class Ingredient {
+        <<enum>>
+        COFFEE_BEANS
+        WATER
+        MILK
+        SUGAR
+        CARAMEL_SYRUP
+    }
+
+    class ToppingType {
+        <<enum>>
+        EXTRA_SUGAR
+        CARAMEL_SYRUP
+    }
+
+    class VendingMachineState {
+        <<interface>>
+        +selectCoffee(machine, coffee)
+        +insertMoney(machine, amount)
+        +dispenseCoffee(machine)
+        +cancel(machine)
+    }
+
+    class ReadyState {
+        +selectCoffee()
+        +insertMoney()
+        +dispenseCoffee()
+        +cancel()
+    }
+
+    class SelectingState {
+        +selectCoffee()
+        +insertMoney()
+        +dispenseCoffee()
+        +cancel()
+    }
+
+    class PaidState {
+        +selectCoffee()
+        +insertMoney()
+        +dispenseCoffee()
+        +cancel()
+    }
+
+    class OutOfIngredientState {
+        +selectCoffee()
+        +insertMoney()
+        +dispenseCoffee()
+        +cancel()
+    }
+
+    class CoffeeVendingMachine {
+        <<singleton>>
+        -INSTANCE: CoffeeVendingMachine
+        -state: VendingMachineState
+        -selectedCoffee: Coffee
+        -moneyInserted: int
+        +getInstance()
+        +selectCoffee(type, toppings)
+        +insertMoney(amount)
+        +dispenseCoffee()
+        +cancel()
+        +setState(state)
+        +reset()
+    }
+
+    class Inventory {
+        <<singleton>>
+        -INSTANCE: Inventory
+        -stock: Map~Ingredient, Integer~
+        +getInstance()
+        +addStock(ingredient, qty)
+        +hasIngredients(recipe) boolean
+        +deductIngredients(recipe) «sync»
+        +printInventory()
+    }
+
+    class CoffeeFactory {
+        +createCoffee(type) Coffee «static»
+    }
+
+    class Coffee {
+        <<abstract>>
+        #coffeeType: String
+        +getCoffeeType() String
+        +prepare() «template method»
+        -grindBeans()
+        -brew()
+        -pourIntoCup()
+        #addCondiments()*
+        +getPrice()* int
+        +getRecipe()* Map
+    }
+
+    class Espresso {
+        +getPrice() int → 150
+        +getRecipe() Map
+        +addCondiments()
+    }
+
+    class Cappuccino {
+        +getPrice() int → 250
+        +getRecipe() Map
+        +addCondiments()
+    }
+
+    class Latte {
+        +getPrice() int → 220
+        +getRecipe() Map
+        +addCondiments()
+    }
+
+    class CoffeeDecorator {
+        <<abstract>>
+        #decoratedCoffee: Coffee
+        +getPrice() int
+        +getRecipe() Map
+        +prepare()
+    }
+
+    class ExtraSugarDecorator {
+        -COST: int = 10
+        -RECIPE_ADDITION: Map
+        +getCoffeeType() String
+        +getPrice() int
+        +getRecipe() Map
+    }
+
+    class CaramelSyrupDecorator {
+        -COST: int = 30
+        -RECIPE_ADDITION: Map
+        +getCoffeeType() String
+        +getPrice() int
+        +getRecipe() Map
+    }
+
+    ReadyState ..|> VendingMachineState
+    SelectingState ..|> VendingMachineState
+    PaidState ..|> VendingMachineState
+    OutOfIngredientState ..|> VendingMachineState
+
+    Espresso --|> Coffee
+    Cappuccino --|> Coffee
+    Latte --|> Coffee
+
+    CoffeeDecorator --|> Coffee
+    ExtraSugarDecorator --|> CoffeeDecorator
+    CaramelSyrupDecorator --|> CoffeeDecorator
+
+    CoffeeVendingMachine *-- VendingMachineState : state
+    CoffeeVendingMachine *-- Coffee : selectedCoffee
+    CoffeeDecorator *-- Coffee : decoratedCoffee
+
+    CoffeeVendingMachine --> Inventory : uses
+    CoffeeVendingMachine --> CoffeeFactory : uses
+    CoffeeFactory ..> Coffee : creates
+
+    Inventory --> Ingredient : tracks
+    CoffeeVendingMachine --> CoffeeType : uses
+    CoffeeVendingMachine --> ToppingType : uses
+```
+</details>
 
 ---
 

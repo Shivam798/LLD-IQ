@@ -22,6 +22,7 @@
         <module>parking-lot</module>
         <module>coffee-vending-machine</module>
         <module>logging-framework</module>
+        <module>pub-sub-system</module>
     </modules>
 
     <build>

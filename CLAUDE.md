@@ -144,7 +144,7 @@ Every LLD question folder MUST have a `README.md` with these sections in order:
 
 ## Class Diagram
 <Excalidraw link for interactive viewing>
-<Embedded image for quick reference>
+<Embedded PNG image (exported at 3x from Excalidraw) for quick reference>
 
 ## Project Structure
 <Tree view of the folder with one-line descriptions per file>
@@ -176,6 +176,9 @@ When adding a new LLD question:
 5. Include a `<ProblemName>Demo.java` as the runnable entry point at package root
 6. Update root `README.md` question table
 7. Apply SOLID, pick design patterns that naturally fit the problem
+8. **Create diagram assets** (BOTH are mandatory):
+   - `class-diagram.excalidraw` — interactive Excalidraw source file at the question root
+   - `src/main/resources/img.png` — PNG exported from Excalidraw at **3x** scale, embedded in README via `![img.png](src/main/resources/img.png)`
 
 ## Class Relationship Guidelines
 

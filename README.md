@@ -9,6 +9,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 1 | Parking Lot System | [`parking-lot/`](parking-lot/) |
 | 2 | Coffee Vending Machine | [`coffee-vending-machine/`](coffee-vending-machine/) |
 | 3 | Logging Framework | [`logging-framework/`](logging-framework/) |
+| 4 | Pub-Sub System | [`pub-sub-system/`](pub-sub-system/) |
 
 ## Common Resources
 

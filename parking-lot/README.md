@@ -55,6 +55,123 @@ https://excalidraw.com/#json=fvtswdhfQckVGfT_XENf1,LNGZyP4X3YUOxj4kMeN_Kw
 
 ![Class Diagram](src/main/resources/img.png)
 
+<details>
+<summary>Mermaid Class Diagram (click to expand)</summary>
+
+```mermaid
+classDiagram
+    direction TB
+
+    class VehicleSize {
+        <<enum>>
+        SMALL
+        MEDIUM
+        LARGE
+    }
+
+    class Vehicle {
+        <<abstract>>
+        -licensePlate: String
+        -size: VehicleSize
+        +getLicensePlate() String
+        +getSize() VehicleSize
+        +toString() String
+    }
+
+    class Car {
+    }
+
+    class Motorcycle {
+    }
+
+    class Truck {
+    }
+
+    class ParkingSpot {
+        -spotId: String
+        -size: VehicleSize
+        -parkedVehicle: Vehicle
+        -available: boolean
+        +isAvailable() boolean «sync»
+        +canFit(VehicleSize) boolean
+        +park(Vehicle) «sync»
+        +unpark() «sync»
+        +getSpotId() String
+        +getSize() VehicleSize
+        +getParkedVehicle() Vehicle
+    }
+
+    class ParkingFloor {
+        -floorNumber: int
+        -spots: List~ParkingSpot~
+        +addSpot(ParkingSpot)
+        +findAvailableSpot(VehicleSize) ParkingSpot
+        +parkVehicle(Vehicle) ParkingSpot «sync»
+        +unparkVehicle(Vehicle) boolean «sync»
+        +getFloorNumber() int
+        +getAvailableSpotCount() int
+    }
+
+    class ParkingTicket {
+        -ticketId: String
+        -vehicle: Vehicle
+        -spot: ParkingSpot
+        -floorNumber: int
+        -entryTime: LocalDateTime
+        -exitTime: LocalDateTime
+        +markExit()
+        +getDurationHours() long
+        +getTicketId() String
+        +getVehicle() Vehicle
+        +getSpot() ParkingSpot
+        +getFloorNumber() int
+        +getEntryTime() LocalDateTime
+        +getExitTime() LocalDateTime
+    }
+
+    class FeeStrategy {
+        <<interface>>
+        +calculateFee(ParkingTicket, VehicleSize) double
+    }
+
+    class VehicleBasedFeeStrategy {
+        +calculateFee(ParkingTicket, VehicleSize) double
+    }
+
+    class ParkingLot {
+        <<singleton>>
+        -instance: ParkingLot
+        -floors: List~ParkingFloor~
+        -feeStrategy: FeeStrategy
+        +getInstance() ParkingLot
+        +addFloor(ParkingFloor)
+        +setFeeStrategy(FeeStrategy)
+        +parkVehicle(Vehicle) Optional~ParkingTicket~ «sync»
+        +unparkVehicle(ParkingTicket) double «sync»
+        +getFloors() List~ParkingFloor~
+        +getTotalAvailableSpots() int
+    }
+
+    Car --|> Vehicle
+    Motorcycle --|> Vehicle
+    Truck --|> Vehicle
+
+    VehicleBasedFeeStrategy ..|> FeeStrategy
+
+    ParkingLot *-- ParkingFloor : floors
+    ParkingLot --> FeeStrategy : feeStrategy
+    ParkingFloor *-- ParkingSpot : spots
+
+    ParkingSpot --> Vehicle : parkedVehicle
+    ParkingSpot --> VehicleSize : size
+    ParkingTicket --> Vehicle : vehicle
+    ParkingTicket --> ParkingSpot : spot
+
+    ParkingLot ..> ParkingTicket : creates
+    Vehicle --> VehicleSize : size
+```
+</details>
+
 ---
 
 ## Project Structure
@@ -105,27 +222,6 @@ parking-lot/
 | **LSP** | `Car`, `Motorcycle`, `Truck` are all substitutable wherever `Vehicle` is used |
 | **ISP** | `FeeStrategy` has one method — no bloated interfaces |
 | **DIP** | `ParkingLot` depends on `FeeStrategy` interface, not `VehicleBasedFeeStrategy` concrete class |
-
----
-
-## How to Build & Run
-
-### Using Maven
-```bash
-mvn clean package
-java -jar target/parking-lot-1.0.0.jar
-```
-
-### Using javac directly
-```bash
-javac -d target/classes \
-    src/main/java/com/parkinglot/enums/*.java \
-    src/main/java/com/parkinglot/model/*.java \
-    src/main/java/com/parkinglot/strategy/*.java \
-    src/main/java/com/parkinglot/*.java
-
-java -cp target/classes com.parkinglot.ParkingLotDemo
-```
 
 ---
 

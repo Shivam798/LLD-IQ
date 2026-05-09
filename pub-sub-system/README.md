@@ -89,6 +89,7 @@ classDiagram
         +addSubscriber(Subscriber)
         +removeSubscriber(Subscriber)
         +broadcast(Message)
+        ~getSubscribers() Set~Subscriber~
     }
 
     class Publisher {
@@ -100,19 +101,20 @@ classDiagram
 
     class Subscriber {
         <<interface>>
-        +getId() String
+        +id() String
         +onMessage(String, Message)
     }
 
     class NewsSubscriber {
         -id: String
-        +getId() String
+        +id() String
         +onMessage(String, Message)
     }
 
     class AlertSubscriber {
+        <<record>>
         -id: String
-        +getId() String
+        +id() String
         +onMessage(String, Message)
     }
 
@@ -186,32 +188,6 @@ pub-sub-system/
 | **LSP** | `NewsSubscriber` and `AlertSubscriber` are fully interchangeable wherever `Subscriber` is expected. Topic doesn't know or care which concrete type it's notifying. |
 | **ISP** | `Subject` has 3 focused methods (add/remove/broadcast). `Subscriber` has exactly 2 focused methods (`getId()` + `onMessage()`). Each interface has a single responsibility — no bloated contracts. |
 | **DIP** | `Topic` depends on the `Subscriber` interface, not concrete classes. `PubSubService` depends on `Subject` (via `Topic implements Subject`), not on concrete topic logic. `Publisher` depends on `PubSubService` for routing, not on `Topic` directly. |
-
----
-
-## How to Build & Run
-
-### Using Maven
-```bash
-mvn clean package
-java -jar target/pub-sub-system-1.0.0.jar
-```
-
-### Using javac directly
-```bash
-javac -d target/classes \
-    src/main/java/com/pubsubsystem/model/Message.java \
-    src/main/java/com/pubsubsystem/observer/Subject.java \
-    src/main/java/com/pubsubsystem/observer/Subscriber.java \
-    src/main/java/com/pubsubsystem/observer/NewsSubscriber.java \
-    src/main/java/com/pubsubsystem/observer/AlertSubscriber.java \
-    src/main/java/com/pubsubsystem/model/Topic.java \
-    src/main/java/com/pubsubsystem/model/PubSubService.java \
-    src/main/java/com/pubsubsystem/model/Publisher.java \
-    src/main/java/com/pubsubsystem/PubSubSystemDemo.java
-
-java -cp target/classes com.pubsubsystem.PubSubSystemDemo
-```
 
 ---
 

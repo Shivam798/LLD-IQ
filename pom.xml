@@ -23,6 +23,7 @@
         <module>coffee-vending-machine</module>
         <module>logging-framework</module>
         <module>pub-sub-system</module>
+        <module>atm</module>
     </modules>
 
     <build>

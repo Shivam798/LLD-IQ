@@ -79,6 +79,7 @@ classDiagram
         WARN(3)
         ERROR(4)
         FATAL(5)
+        -severity: int
         +isGreaterOrEqual(LogLevel) boolean
     }
 
@@ -144,6 +145,8 @@ classDiagram
         +error(String)
         +fatal(String)
         -callAppenders(LogMessage)
+        ~getName() String
+        ~getAppenders() List~LogAppender~
     }
 
     class LogManager {
@@ -155,6 +158,7 @@ classDiagram
         +getInstance() LogManager
         +getLogger(String) Logger «sync»
         +getRootLogger() Logger
+        ~getProcessor() AsyncLogProcessor
         +shutdown()
     }
 
@@ -235,27 +239,6 @@ logging-framework/
 | **LSP** | `ConsoleAppender` and `FileAppender` are fully interchangeable wherever `LogAppender` is expected. `SimpleTextFormatter` is substitutable for any `LogFormatter`. |
 | **ISP** | `LogAppender` has exactly 4 focused methods. `LogFormatter` has a single `format()` method. No bloated interfaces. |
 | **DIP** | `Logger` depends on `LogAppender` interface, not concrete appenders. Appenders depend on `LogFormatter` interface, not concrete formatters. |
-
----
-
-## How to Build & Run
-
-### Using Maven
-```bash
-mvn clean package
-java -jar target/logging-framework-1.0.0.jar
-```
-
-### Using javac directly
-```bash
-javac -d target/classes \
-    src/main/java/com/loggingframework/enums/*.java \
-    src/main/java/com/loggingframework/model/*.java \
-    src/main/java/com/loggingframework/strategy/*.java \
-    src/main/java/com/loggingframework/*.java
-
-java -cp target/classes com.loggingframework.LoggingFrameworkDemo
-```
 
 ---
 

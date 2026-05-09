@@ -139,6 +139,11 @@ classDiagram
         +dispenseCoffee()
         +cancel()
         +setState(state)
+        +getState() VendingMachineState
+        +setSelectedCoffee(coffee)
+        +getSelectedCoffee() Coffee
+        +setMoneyInserted(amount)
+        +getMoneyInserted() int
         +reset()
     }
 
@@ -202,6 +207,7 @@ classDiagram
         +getCoffeeType() String
         +getPrice() int
         +getRecipe() Map
+        +prepare()
     }
 
     class CaramelSyrupDecorator {
@@ -210,6 +216,7 @@ classDiagram
         +getCoffeeType() String
         +getPrice() int
         +getRecipe() Map
+        +prepare()
     }
 
     ReadyState ..|> VendingMachineState
@@ -302,29 +309,6 @@ coffee-vending-machine/
 | **LSP** | All `Coffee` subclasses (Espresso, Latte, Cappuccino) and decorators are interchangeable wherever `Coffee` is expected |
 | **ISP** | `VendingMachineState` has exactly the 4 operations the machine supports — no extras |
 | **DIP** | `CoffeeVendingMachine` depends on `VendingMachineState` interface, not concrete states. Works with `Coffee` abstraction, not specific types. |
-
----
-
-## How to Build & Run
-
-### Using Maven
-```bash
-mvn clean package
-java -jar target/coffee-vending-machine-1.0.0.jar
-```
-
-### Using javac directly
-```bash
-javac -d target/classes \
-    src/main/java/com/coffeevendingmachine/enums/*.java \
-    src/main/java/com/coffeevendingmachine/model/*.java \
-    src/main/java/com/coffeevendingmachine/decorator/*.java \
-    src/main/java/com/coffeevendingmachine/factory/*.java \
-    src/main/java/com/coffeevendingmachine/state/*.java \
-    src/main/java/com/coffeevendingmachine/*.java
-
-java -cp target/classes com.coffeevendingmachine.CoffeeVendingMachineDemo
-```
 
 ---
 

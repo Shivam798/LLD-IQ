@@ -155,9 +155,6 @@ Every LLD question folder MUST have a `README.md` with these sections in order:
 ## SOLID Principles Applied
 <Table: Principle | How it's applied in this specific solution>
 
-## How to Build & Run
-<Maven and javac commands>
-
 ## Thread Safety
 <What's synchronized and why>
 
@@ -177,8 +174,8 @@ When adding a new LLD question:
 6. Update root `README.md` question table
 7. Apply SOLID, pick design patterns that naturally fit the problem
 8. **Create diagram assets** (BOTH are mandatory):
-   - `class-diagram.excalidraw` — interactive Excalidraw source file at the question root
-   - `src/main/resources/img.png` — PNG exported from Excalidraw at **3x** scale, embedded in README via `![img.png](src/main/resources/img.png)`
+   - `class-diagram.excalidraw` — interactive Excalidraw source file at the question root. **Claude must generate this file** using the Excalidraw JSON format (see existing `.excalidraw` files for reference). Include all classes as color-coded rectangles with fields/methods, and arrows for relationships (dotted for implements, solid for extends/composition, labeled with relationship type).
+   - `src/main/resources/img.png` — PNG exported from Excalidraw at **3x** scale, embedded in README via `![img.png](src/main/resources/img.png)` (user exports this manually from the `.excalidraw` file)
 
 ## Class Relationship Guidelines
 

@@ -10,6 +10,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 2 | Coffee Vending Machine | [`coffee-vending-machine/`](coffee-vending-machine/) |
 | 3 | Logging Framework | [`logging-framework/`](logging-framework/) |
 | 4 | Pub-Sub System | [`pub-sub-system/`](pub-sub-system/) |
+| 5 | ATM System | [`atm/`](atm/) |
 
 ## Common Resources
 
@@ -17,10 +18,4 @@ This repo covers all the commonly asked Low Level Design questions for software 
 
 ## How to Run Any Question
 
-```bash
-cd <question-folder>
-mvn clean package
-java -jar target/<artifact>.jar
-```
-
-Or compile directly with `javac` — see each subfolder's README for details.
+Use your IDE's run button on the `*Demo.java` file in any question folder.

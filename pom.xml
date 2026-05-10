@@ -24,6 +24,7 @@
         <module>logging-framework</module>
         <module>pub-sub-system</module>
         <module>atm</module>
+        <module>elevator-system</module>
     </modules>
 
     <build>

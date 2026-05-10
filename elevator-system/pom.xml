@@ -10,15 +10,16 @@
         <version>1.0.0</version>
     </parent>
 
-    <artifactId>logging-framework</artifactId>
+    <artifactId>elevator-system</artifactId>
     <packaging>jar</packaging>
 
-    <name>Logging Framework</name>
-    <description>Low Level Design - Logging Framework System</description>
+    <name>Elevator System</name>
+    <description>Low Level Design - Elevator System</description>
 
     <properties>
-        <main.class>com.loggingframework.LoggingFrameworkDemo</main.class>
+        <main.class>com.elevatorsystem.ElevatorSystemDemo</main.class>
     </properties>
+
     <build>
         <plugins>
             <plugin>

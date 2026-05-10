@@ -248,6 +248,103 @@ classDiagram
 
 ---
 
+## How to Approach This Problem (Smallest → Biggest)
+
+### Layer 1: The Atoms — Enums
+
+Start with three tiny questions: **"What kinds of coffee exist?"**, **"What raw materials does a machine hold?"**, and **"What optional extras can a customer add?"**
+
+**`CoffeeType`** — `ESPRESSO`, `LATTE`, `CAPPUCCINO`. This is your menu. Each value maps to a completely different recipe, price, and preparation behavior. In a real Starbucks, this is the menu board.
+
+**`Ingredient`** — `COFFEE_BEANS`, `WATER`, `MILK`, `SUGAR`, `CARAMEL_SYRUP`. These are the physical things inside the machine's canisters. Every coffee is just a combination of these in different quantities. Think of them as the periodic table for coffee — everything is built from these elements.
+
+**`ToppingType`** — `EXTRA_SUGAR`, `CARAMEL_SYRUP`. These are the *customer-facing* add-ons. Notice this is separate from `Ingredient` on purpose — a topping is a concept (something the customer asks for), while an ingredient is a physical resource (something the machine consumes). This separation matters because one topping might require multiple ingredients in the future.
+
+**Interview power move**: "I start with enums because they define the vocabulary of the domain. Before writing a single class, I want the bounded language — what coffee types, what raw materials, what add-ons. Everything else speaks in these terms."
+
+### Layer 2: The Product — Coffee as an abstract concept
+
+Ask yourself: what do Espresso, Latte, and Cappuccino have in common? They all have a **price**, a **recipe** (Map of Ingredient to quantity), and a **preparation sequence**. But each one differs in those details. That screams abstract class.
+
+**`Coffee`** — the abstract base class with two roles baked in:
+
+1. **Template Method** — `prepare()` defines the skeleton: `grindBeans()` → `brew()` → `addCondiments()` → `pourIntoCup()`. The first three steps are identical for every coffee. Only `addCondiments()` varies — Espresso does nothing, Latte adds steamed milk, Cappuccino adds milk and foam. The subclass only overrides the *hook*, not the whole algorithm.
+
+2. **Decorator Component** — `Coffee` is also the component interface for the Decorator pattern. Decorators will wrap it to add toppings. This dual role is elegant: any `Coffee` — whether base or decorated — exposes `getPrice()`, `getRecipe()`, and `prepare()`.
+
+**`Espresso`**, **`Latte`**, **`Cappuccino`** — concrete coffees. Each one sets its own `coffeeType` name, returns its own price (150, 220, 250), defines its recipe as an immutable `Map.of(...)`, and overrides `addCondiments()`.
+
+**Mental model**: A Coffee is like a blueprint card in the machine — "to make a Latte, you need 7g beans, 30ml water, 150ml milk, it costs 220, and during prep you add steamed milk." The machine reads this card and follows it.
+
+### Layer 3: The Decorator Layer — toppings without touching base classes
+
+Here's the key design question: how do you add Extra Sugar to a Latte without modifying `Latte.java`? You could add boolean flags like `hasExtraSugar`, but then every new topping means modifying every coffee class. That violates OCP.
+
+**`CoffeeDecorator`** — abstract class that extends `Coffee` and wraps another `Coffee`. It delegates `getPrice()`, `getRecipe()`, and `prepare()` to the wrapped coffee by default. Concrete decorators override these to *add* behavior.
+
+**`ExtraSugarDecorator`** — wraps any coffee, adds 10 to the price, merges `{SUGAR: 1}` into the recipe, and after calling `super.prepare()` (which prepares the base coffee), prints "Stirring in Extra Sugar."
+
+**`CaramelSyrupDecorator`** — same pattern, adds 30 to price, merges `{CARAMEL_SYRUP: 10}` into the recipe, prints "Drizzling Caramel Syrup on top."
+
+The beauty: `new CaramelSyrupDecorator(new ExtraSugarDecorator(new Latte()))` is a valid `Coffee`. You can stack arbitrarily. The machine doesn't know or care how many layers of decoration exist — it just calls `getPrice()`, `getRecipe()`, and `prepare()` on whatever `Coffee` it's holding.
+
+**Interview power move**: "I use Decorator here instead of subclassing because toppings are combinatorial. With 3 coffees and 2 toppings, subclassing gives you 3 x 4 = 12 classes (Latte, LatteWithSugar, LatteWithCaramel, LatteWithBoth, ...). Decorator gives you 3 + 2 = 5 classes, and handles any combination at runtime."
+
+### Layer 4: The Factory — decoupling creation from use
+
+**`CoffeeFactory`** — a static factory method that takes a `CoffeeType` enum and returns the right `Coffee` subclass. `ESPRESSO → new Espresso()`, `LATTE → new Latte()`, `CAPPUCCINO → new Cappuccino()`.
+
+This seems simple, but it has a critical purpose: the `CoffeeVendingMachine` never says `new Latte()`. It says `CoffeeFactory.createCoffee(type)`. When you add a new coffee type (say Americano), you add the enum value, create the class, and add one case in the factory. The machine code doesn't change.
+
+**Mental model**: The factory is like the machine's internal lookup table — "customer pressed button 2, that maps to Latte, here's a fresh Latte object."
+
+### Layer 5: The State Machine — behavior that changes with context
+
+This is where most candidates either shine or stumble. A vending machine behaves **completely differently** depending on what phase of the transaction it's in:
+- In Ready state, you can select coffee but can't dispense
+- In Selecting state, you can insert money but can't select again
+- In Paid state, you can dispense but can't insert more money
+- In OutOfIngredient state, everything fails gracefully and triggers a refund
+
+Instead of `if (state == READY) { ... } else if (state == SELECTING) { ... }` in every method, you make each state a separate class. This is the **State Pattern**.
+
+**`VendingMachineState`** — interface with exactly 4 methods: `selectCoffee()`, `insertMoney()`, `dispenseCoffee()`, `cancel()`. These are the 4 buttons on the machine. Every state must respond to all 4 — even if the response is "you can't do that right now."
+
+**`ReadyState`** — idle. `selectCoffee()` stores the coffee and transitions to SelectingState. Everything else prints an error message.
+
+**`SelectingState`** — coffee chosen, waiting for money. `insertMoney()` accumulates the amount. Once total >= price, it transitions to PaidState. `cancel()` refunds and resets to ReadyState.
+
+**`PaidState`** — money sufficient, ready to make coffee. `dispenseCoffee()` is where the magic happens: check inventory → deduct ingredients → call `coffee.prepare()` (Template Method runs) → return change → reset to ReadyState. If inventory is insufficient, it transitions to OutOfIngredientState and auto-cancels.
+
+**`OutOfIngredientState`** — a transient error state. `cancel()` refunds money and resets to ReadyState. Everything else is rejected.
+
+**Interview power move**: "Each state only knows about legal transitions from itself. ReadyState knows it can go to SelectingState, PaidState knows it can go to ReadyState or OutOfIngredientState. The state machine is distributed across state objects rather than centralized in a giant switch statement — this makes it trivially extensible. Need a MaintenanceState? One new class, zero changes to existing states."
+
+### Layer 6: The Inventory — resource management as a Singleton
+
+**`Inventory`** — a Singleton holding a `ConcurrentHashMap<Ingredient, Integer>`. It knows three things: how to add stock, how to check if a recipe can be fulfilled (`hasIngredients`), and how to atomically deduct ingredients (`deductIngredients`, which is `synchronized`).
+
+The Inventory is separate from the machine because SRP — the machine orchestrates the transaction flow, the inventory manages physical resources. In a real system, you might have one inventory shared across multiple dispensing units.
+
+### Layer 7: The Machine — the Singleton orchestrator
+
+**`CoffeeVendingMachine`** — ties everything together. It's a Singleton (one machine per system). It holds:
+- The current **state** (delegation target)
+- The currently **selected coffee** (a `Coffee` object, possibly decorated)
+- The **money inserted** so far
+
+When `selectCoffee(CoffeeType, List<ToppingType>)` is called, the machine does two things before delegating to the state: (1) uses `CoffeeFactory` to create the base coffee, and (2) wraps it with decorator(s) for each topping. The result is a fully-configured `Coffee` object that knows its own total price, combined recipe, and full preparation sequence. Then the state takes over.
+
+**Mental model**: The machine is the cashier at a coffee shop. It doesn't know how to make coffee (that's the `Coffee` object). It doesn't know about inventory levels (that's `Inventory`). It doesn't know the rules of the transaction flow (that's the current `State`). It just coordinates — "customer wants X, here's the order, pass it along."
+
+### Interview Summary (say this to your interviewer)
+
+> "I start with three enums — CoffeeType, Ingredient, ToppingType — to define the domain vocabulary. Then I model Coffee as an abstract class with Template Method for preparation (grind, brew, condiments, pour) and abstract getPrice/getRecipe. Concrete coffees override the hook and define their recipe. For toppings, I use Decorator — each decorator wraps a Coffee and adds to the price, recipe, and prep steps, so toppings are combinatorial without a class explosion. CoffeeFactory decouples creation from the machine. The machine itself is a state machine — Ready, Selecting, Paid, OutOfIngredient — each state handles all 4 actions differently, making transitions explicit and extensible. Inventory is a separate Singleton for resource management with synchronized deduction. The CoffeeVendingMachine Singleton orchestrates everything: factory creates, decorators wrap, state delegates, inventory checks."
+
+Each layer only knows about the layer below it. Five patterns — Singleton, State, Factory, Decorator, Template Method — each solving exactly one problem.
+
+---
+
 ## Project Structure
 
 ```

@@ -1,17 +1,9 @@
 package com.loggingframework.model;
 
 import com.loggingframework.enums.LogLevel;
-import lombok.Getter;
 
 import java.time.LocalDateTime;
 
-/**
- * Immutable value object representing a single log event.
- * Captures timestamp, severity level, originating logger name,
- * the thread that created the message, and the message content.
- * Thread-safe by design — all fields are final and set at construction time.
- */
-@Getter
 public final class LogMessage {
     private final LocalDateTime timestamp;
     private final LogLevel level;
@@ -26,4 +18,14 @@ public final class LogMessage {
         this.threadName = Thread.currentThread().getName();
         this.message = message;
     }
+
+    public LocalDateTime getTimestamp() { return timestamp; }
+
+    public LogLevel getLevel() { return level; }
+
+    public String getLoggerName() { return loggerName; }
+
+    public String getThreadName() { return threadName; }
+
+    public String getMessage() { return message; }
 }

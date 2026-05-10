@@ -11,6 +11,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 3 | Logging Framework | [`logging-framework/`](logging-framework/) |
 | 4 | Pub-Sub System | [`pub-sub-system/`](pub-sub-system/) |
 | 5 | ATM System | [`atm/`](atm/) |
+| 6 | Elevator System | [`elevator-system/`](elevator-system/) |
 
 ## Common Resources
 

@@ -25,6 +25,7 @@
         <module>pub-sub-system</module>
         <module>atm</module>
         <module>elevator-system</module>
+        <module>library-management-system</module>
     </modules>
 
     <build>

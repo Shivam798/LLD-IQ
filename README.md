@@ -12,6 +12,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 4 | Pub-Sub System | [`pub-sub-system/`](pub-sub-system/) |
 | 5 | ATM System | [`atm/`](atm/) |
 | 6 | Elevator System | [`elevator-system/`](elevator-system/) |
+| 7 | Library Management System | [`library-management-system/`](library-management-system/) |
 
 ## Common Resources
 

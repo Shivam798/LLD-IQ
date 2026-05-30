@@ -13,6 +13,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 5 | ATM System | [`atm/`](atm/) |
 | 6 | Elevator System | [`elevator-system/`](elevator-system/) |
 | 7 | Library Management System | [`library-management-system/`](library-management-system/) |
+| 8 | Movie Ticket Booking System | [`movie-ticket-booking-system/`](movie-ticket-booking-system/) |
 
 ## Common Resources
 

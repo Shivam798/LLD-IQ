@@ -26,6 +26,7 @@
         <module>atm</module>
         <module>elevator-system</module>
         <module>library-management-system</module>
+        <module>movie-ticket-booking-system</module>
     </modules>
 
     <build>

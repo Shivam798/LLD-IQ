@@ -145,6 +145,14 @@ Every LLD question folder MUST have a `README.md` with these sections in order:
 ## Class Diagram
 <Excalidraw link for interactive viewing>
 <Embedded PNG image (exported at 3x from Excalidraw) for quick reference>
+<Mermaid `classDiagram` block inside a collapsed <details> with summary "Mermaid Class Diagram (click to expand)" — covers every class with fields/methods and all relationships (--|>, *--, o--, ..>, -->)>
+
+## How to Approach This Problem (Smallest → Biggest)
+<MANDATORY. A layered walkthrough that builds the design from the smallest insight upward.
+Each "### Layer N: <pithy title>" paragraph explains ONE design decision and *why* it was made
+that way — not what the code does. End with an "### Interview summary (say this verbatim)"
+blockquote that compresses the whole design into a single spoken-aloud paragraph.
+This section is the interview-prep core of the repo — never skip it.>
 
 ## Project Structure
 <Tree view of the folder with one-line descriptions per file>
@@ -162,6 +170,16 @@ Every LLD question folder MUST have a `README.md` with these sections in order:
 <How to add new features without modifying existing code>
 ```
 
+### Section style rules (apply to every README)
+
+- **"How to Approach This Problem (Smallest → Biggest)"** is mandatory. Build the design layer by layer:
+  - Layer 1 should be the smallest, most surprising insight (e.g. "a snake and a ladder are the same thing"). Each later layer adds one decision on top.
+  - Explain *why* each choice — Liskov, SRP, race conditions, testability, etc. — not what the method does.
+  - Call out the interview-grade trap or requirement in its own layer (concurrency, locking, ambiguity between similar-sounding entities).
+  - Close with a single blockquoted "Interview summary (say this verbatim)" paragraph that a candidate could speak in 60–90 seconds.
+- **Class Diagram section** must include BOTH the exported `img.png` and a collapsed Mermaid `classDiagram` block — Mermaid is the in-GitHub fallback when the PNG hasn't been regenerated yet.
+- **No "How to Build & Run" section** anywhere — running is left to the IDE.
+
 ## Conventions for New Questions
 
 When adding a new LLD question:
@@ -173,9 +191,11 @@ When adding a new LLD question:
 5. Include a `<ProblemName>Demo.java` as the runnable entry point at package root
 6. Update root `README.md` question table
 7. Apply SOLID, pick design patterns that naturally fit the problem
-8. **Create diagram assets** (BOTH are mandatory):
+8. **Create diagram assets** (ALL THREE are mandatory):
    - `class-diagram.excalidraw` — interactive Excalidraw source file at the question root. **Claude must generate this file** using the Excalidraw JSON format (see existing `.excalidraw` files for reference). Include all classes as color-coded rectangles with fields/methods, and arrows for relationships (dotted for implements, solid for extends/composition, labeled with relationship type).
    - `src/main/resources/img.png` — PNG exported from Excalidraw at **3x** scale, embedded in README via `![img.png](src/main/resources/img.png)` (user exports this manually from the `.excalidraw` file)
+   - **Mermaid `classDiagram`** block inside the README's Class Diagram section, wrapped in a collapsed `<details>` element (`<summary>Mermaid Class Diagram (click to expand)</summary>`). This is the in-GitHub fallback and must cover the same classes and relationships as the Excalidraw source.
+9. **Write the "How to Approach This Problem (Smallest → Biggest)" section** — see the section style rules above. This is non-negotiable and is the core differentiator of this repo from a generic LLD codebase.
 
 ## Class Relationship Guidelines
 

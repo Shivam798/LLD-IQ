@@ -27,6 +27,8 @@
         <module>elevator-system</module>
         <module>library-management-system</module>
         <module>movie-ticket-booking-system</module>
+        <module>splitwise</module>
+        <module>snake-and-ladder</module>
     </modules>
 
     <build>

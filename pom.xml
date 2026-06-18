@@ -29,6 +29,7 @@
         <module>movie-ticket-booking-system</module>
         <module>splitwise</module>
         <module>snake-and-ladder</module>
+        <module>lru-cache</module>
     </modules>
 
     <build>

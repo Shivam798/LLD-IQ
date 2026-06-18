@@ -16,6 +16,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 8 | Movie Ticket Booking System | [`movie-ticket-booking-system/`](movie-ticket-booking-system/) |
 | 9 | Splitwise | [`splitwise/`](splitwise/) |
 | 10 | Snake and Ladder Game | [`snake-and-ladder/`](snake-and-ladder/) |
+| 11 | LRU Cache (with LFU strategy variant) | [`lru-cache/`](lru-cache/) |
 
 ## Common Resources
 

@@ -30,6 +30,7 @@
         <module>splitwise</module>
         <module>snake-and-ladder</module>
         <module>lru-cache</module>
+        <module>rate-limiter</module>
     </modules>
 
     <build>

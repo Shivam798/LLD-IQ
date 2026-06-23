@@ -17,6 +17,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 9 | Splitwise | [`splitwise/`](splitwise/) |
 | 10 | Snake and Ladder Game | [`snake-and-ladder/`](snake-and-ladder/) |
 | 11 | LRU Cache (with LFU strategy variant) | [`lru-cache/`](lru-cache/) |
+| 12 | Rate Limiter (with Token Bucket / Sliding Window strategies) | [`rate-limiter/`](rate-limiter/) |
 
 ## Common Resources
 

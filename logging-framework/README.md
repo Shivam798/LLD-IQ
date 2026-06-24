@@ -350,3 +350,23 @@ logging-framework/
 - **New message format** → implement `LogFormatter` (e.g., `JsonFormatter`, `XmlFormatter`) and set on any appender
 - **Filtering** → add a `LogFilter` strategy interface on `LogAppender` for fine-grained message filtering
 - **Log rotation** → create `RollingFileAppender` implementing `LogAppender` with size/time-based rotation
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `synchronized`, a `Concurrent*` / `CopyOnWrite*` collection, or an `ExecutorService`)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `synchronized append()` in `FileAppender`, the `CopyOnWriteArrayList` backing `Logger.appenders`, the `ConcurrentHashMap` in `LogManager.loggers`, or the single-thread `ExecutorService` inside `AsyncLogProcessor`, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. Why is `FileAppender.append()` `synchronized` instead of relying on the single async thread?
+The method does `writer.write(...)` then `writer.flush()` on a shared `FileWriter` — **two non-atomic steps on one stream**, so concurrent writers would interleave and corrupt log lines. `synchronized` serializes the write+flush as one critical section. Even though `AsyncLogProcessor` is single-threaded today, the **same `FileAppender` instance can be attached to multiple loggers** and nothing forbids a future multi-thread pool, so the appender guards its own stream rather than trusting the caller's threading model — that's defense-in-depth, not redundancy.
+
+### Q2. Why `CopyOnWriteArrayList` for `Logger.appenders` instead of a synchronized list?
+Appenders are read on **every** log call (`callAppenders` iterates them) but added only at configuration time via `addAppender`. **COW gives lock-free snapshot reads** and safe iteration even while another thread calls `addAppender`, with no `ConcurrentModificationException`. The whole-array copy on each write is O(n), but since writes are rare and reads are the hot path, that cost is irrelevant — whereas a `Collections.synchronizedList` would force every read on the hot path to acquire a lock.
+
+### Q3. Why `ConcurrentHashMap` for `LogManager.loggers` rather than a plain `HashMap`?
+`loggers` is the **registry of named loggers** queried concurrently by `getLogger(name)` from many application threads. A plain `HashMap` can corrupt its internal table or spin on resize under concurrent access. `ConcurrentHashMap` gives **lock-striped, thread-safe reads/writes** without locking the whole map. Note `getLogger` is *also* `synchronized` — the map keeps reads safe, while the method-level lock makes the **multi-step recursive parent-resolution + put** atomic so two threads can't create duplicate loggers for the same name (check-then-act needs more than a thread-safe map).
+
+### Q4. Why an `ExecutorService` for async logging, and what's the trade-off?
+`AsyncLogProcessor` wraps `Executors.newSingleThreadExecutor(...)` so `logger.info()` **submits a task and returns immediately**, decoupling the caller from slow file I/O instead of blocking on `flush()`. A single thread also **serializes writes (preserving log order)** and lets appenders skip their own locking. The trade-off is a lifecycle and an **unbounded task queue**: a slow appender can back up memory, and you must drain it — `stop()` does `shutdown()` + `awaitTermination(2, SECONDS)` + `shutdownNow()`, and the worker is a **daemon thread** so the JVM can still exit if someone forgets to call `shutdown()`.

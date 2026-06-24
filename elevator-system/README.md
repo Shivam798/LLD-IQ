@@ -375,3 +375,31 @@ elevator-system/
 - **Capacity limit** → add `maxCapacity` field to `Elevator`, check before accepting requests
 - **Priority requests** → extend `Request` with priority, use `PriorityQueue` instead of `TreeSet`
 - **Floor range per elevator** → add min/max floor to `Elevator`, filter in selection strategy
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `volatile`, `Atomic*`, `synchronized`, or an `ExecutorService`)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `Elevator.running` declared `volatile` (the flag the elevator's own thread reads in `run()` while another thread flips it in `stopElevator()`) they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. `Elevator.running` is `volatile` — why, and what does it guarantee?
+
+`volatile` gives the **visibility guarantee**: the write in `stopElevator()` (`running = false`) is flushed to main memory and the elevator thread's `while (running)` loop in `run()` reads it fresh instead of from a stale CPU-cache copy — without it the thread could spin forever. It is a **single-writer, no read-modify-write** flag, so we get correctness without the cost of `synchronized`; the keyword guarantees visibility, **not** atomicity, but a plain boolean flag never needs atomicity.
+
+### Q2. `Elevator.currentFloor` is an `AtomicInteger` — why not a plain `int` or `synchronized`?
+
+`currentFloor` is written by the **owning elevator thread** in `setCurrentFloor()` but read concurrently by **observer notifications** and the `NearestElevatorStrategy` comparing distances on the request thread. `AtomicInteger` provides a **lock-free, atomic, visible** read/write (`get()`/`set()`) — a plain `int` would risk stale reads across cores, and a full `synchronized` block would be heavier than needed for a single counter. It is the right tool because the floor is a frequently-read shared scalar, not a compound structure.
+
+### Q3. `Elevator.addRequest()` is `synchronized` — why is `volatile`/`Atomic*` not enough here?
+
+`addRequest()` performs a **compound mutation**: it delegates to the current state which inspects `currentFloor` and then adds to `upRequests` or `downRequests` (non-thread-safe `TreeSet`s). Multiple threads (external dispatch via `requestElevator()` and internal calls via `selectFloor()`) can hit the same elevator at once, so the whole read-decide-mutate sequence must be **atomic** — that needs a lock. `volatile`/`AtomicInteger` only make a single field visible/atomic; they cannot guard a multi-step update to a `TreeSet`, which is exactly why `synchronized` is used instead.
+
+### Q4. Why an `ExecutorService` (`Executors.newFixedThreadPool`) instead of raw `new Thread()` per elevator?
+
+`ElevatorSystem` holds a `fixedThreadPool(numElevators)` and `submit()`s each `Elevator` (a `Runnable`) in `start()`. A **managed pool** gives clean lifecycle control — `shutdown()` stops accepting work and lets running elevators finish — plus thread reuse, bounded thread count, and a single ownership point, whereas raw `new Thread().start()` scatters unmanaged threads with no coordinated shutdown and no reuse. Fixed-size is the natural fit because the elevator count is known and constant.
+
+### Q5. The `ElevatorSystem` Singleton uses double-checked locking with a `volatile instance` — why both?
+
+The `synchronized (ElevatorSystem.class)` block makes the *creation* atomic so two threads can't both build an instance; the outer null-check avoids paying for the lock on every `getInstance()` call after construction. The `instance` field **must be `volatile`** so other threads see a fully-constructed object — without it, instruction reordering could publish a non-null reference before the constructor finishes, handing out a half-initialized system.

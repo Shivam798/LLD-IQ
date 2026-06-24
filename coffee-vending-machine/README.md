@@ -423,3 +423,27 @@ coffee-vending-machine/
 - **New topping** → add enum value in `ToppingType`, create decorator extending `CoffeeDecorator`, add case in `selectCoffee()`
 - **New state** → implement `VendingMachineState` (e.g., `MaintenanceState`)
 - **New payment method** → can be added without modifying existing state logic
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `synchronized` or a `Concurrent*` collection)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `Inventory.deductIngredients()` marked `synchronized` and the `private final Map<Ingredient, Integer> stock = new ConcurrentHashMap<>()` field, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. Why is `Inventory.deductIngredients()` marked `synchronized` — isn't `ConcurrentHashMap` already thread-safe?
+
+Because the method is a **check-then-act** sequence, not a single map operation. It first calls `hasIngredients(recipe)` (read) and *then* does `stock.put(ingredient, stock.get(ingredient) - qty)` (write) for each ingredient. `ConcurrentHashMap` makes each individual `get`/`put` atomic, but it can't make the *check* and the *act* atomic together — two threads could both pass `hasIngredients` for the last shot of milk, then both deduct, driving stock negative (a **lost update / oversell**). `synchronized` makes the whole verify-and-deduct block atomic so only one order mutates `stock` at a time.
+
+### Q2. Why is the deduct loop itself unsafe without the lock, even though each `put` is atomic?
+
+`stock.put(ingredient, stock.get(ingredient) - qty)` is a **read-modify-write**: read the count, subtract, write it back. If two threads interleave between the `get` and the `put`, one update is silently lost. Atomicity of a single `put` only guarantees the *write* lands cleanly — it does nothing to protect the compute-then-store gap. The fix is either the surrounding `synchronized` (what this code does) or an atomic compute like `stock.merge(...)` / `stock.compute(...)`.
+
+### Q3. Why `ConcurrentHashMap` for `stock` instead of a plain `HashMap` or `Collections.synchronizedMap`?
+
+A plain `HashMap` is *not* safe under concurrent writes — interleaved `put`s can corrupt internal buckets or, on older JDKs, spin into an infinite loop on resize. `Collections.synchronizedMap` is safe but locks the *entire* map on every single operation, so concurrent reads (e.g. `hasIngredients` streaming over entries, `printInventory`) serialize needlessly. `ConcurrentHashMap` gives lock-free reads and fine-grained (per-bin) write locking, so the high-frequency reads stay fast while writes remain safe — the right default for a shared, read-heavy stock map.
+
+### Q4. If the deduct path is already `synchronized`, why not just use a `HashMap` and rely on the lock?
+
+Because not every access to `stock` goes through the lock. `addStock()` (via `merge`), `hasIngredients()`, and `printInventory()` all touch the map *without* `synchronized`. With a plain `HashMap`, a restock or a read happening concurrently with a deduct would be an unguarded data race. `ConcurrentHashMap` keeps those un-synchronized accessors safe on their own, while `synchronized` is reserved only for the compound check-then-act in `deductIngredients()` that the map alone can't protect.

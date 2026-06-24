@@ -454,3 +454,35 @@ Chosen lock granularity: **per-show**. Two cinemas, two different shows, two dif
 - **Seat-hold UX in the UI** → expose the lock TTL from `SeatLockManager`, push a countdown to the client
 - **Cancellation + refund** → `Booking.cancelBooking()` already flips seats back; add a `RefundStrategy` paired with `PaymentStrategy` for the reverse leg
 - **Fairness / queueing under high load** → replace `synchronized(show)` with a fair `ReentrantLock(true)` per show, or move to a per-show single-writer actor
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `volatile`, a `Concurrent*` / `CopyOnWrite*` collection, `synchronized`, or a `ScheduledExecutorService`)
+
+> Interviewers treat these keywords as an invitation. The moment they spot the `synchronized (show)` block guarding the seat-lock map in `SeatLockManager`, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. How do you stop two users from booking the same seat?
+
+This is the **check-then-act race**: both threads read `seat.getStatus() == AVAILABLE`, both pass, both go on to pay, both book — a double-booking. In `SeatLockManager.lockSeats` the entire *validate-all-AVAILABLE → flip-all-to-LOCKED* sequence runs inside `synchronized (show)`, so it is **atomic**: once thread A enters, thread B blocks until A has marked the seats `LOCKED`, and B's pre-check pass then sees them taken and returns `false`. The lock is the gate; payment happens *after* the seat is already `LOCKED`, so the network-bound `paymentStrategy.pay(...)` call can't reopen the window.
+
+### Q2. Isn't `ConcurrentHashMap` enough on its own — why the `synchronized` block?
+
+No. `lockedSeats` being a `ConcurrentHashMap` only makes each `get`/`put` individually thread-safe; it does **not** make a *get-then-put* atomic. The race here spans a read of `seat.getStatus()` **and** a write of `setStatus(LOCKED)` across *multiple* seats — a compound, multi-key invariant no single map operation can cover. That's why the check+set lives in `synchronized (show)`. Where a single-key atomic *does* suffice, the code uses it: `lockedSeats.computeIfAbsent(show, s -> new ConcurrentHashMap<>())` atomically creates the inner per-show map so two threads can't install competing maps for a brand-new show.
+
+### Q3. Why `ConcurrentHashMap` for the catalog, lock, and booking maps instead of `HashMap` or `Collections.synchronizedMap`?
+
+`MovieBookingSystem`'s five catalog maps (`cities`, `cinemas`, `movies`, `shows`, `users`), `SeatLockManager.lockedSeats`, and `BookingManager.bookings` are all read and written by many booking/admin threads at once. A plain `HashMap` can corrupt its internal table (or infinite-loop on resize) under concurrent writes. `Collections.synchronizedMap` is safe but locks the **whole map** on every operation, serializing unrelated readers. `ConcurrentHashMap` uses fine-grained bucket-level locking, so concurrent reads and writes to different keys proceed in parallel — exactly the read-heavy, multi-threaded catalog access pattern here.
+
+### Q4. Why `CopyOnWriteArrayList` for `Screen.seats` and `MovieSubject.observers`?
+
+Both are **read-heavy, write-rarely** lists that get *iterated* while other threads might touch them. `Screen.seats` is populated once at admin setup and then iterated on every `getAvailableSeats` / lock pass; `MovieSubject.observers` is iterated in `notifyObservers()` while users may register a `UserObserver` mid-notification. `CopyOnWriteArrayList` hands each iterator an immutable snapshot, so iteration never throws `ConcurrentModificationException` and needs no explicit lock — the cost (copying the whole array on every `add`) is irrelevant because writes are rare. A plain `ArrayList` would need external synchronization around every iteration.
+
+### Q5. Why is `Seat.status` marked `volatile`?
+
+`status` is flipped by one thread (the booking thread holding `synchronized (show)`, or the scheduler's release task) and read by others (`getAvailableSeats`, the next `lockSeats` pre-check). `volatile` guarantees **visibility**: a write to `AVAILABLE → LOCKED → BOOKED` is immediately seen by every other thread, with no stale cached value. It's the right tool here because each transition is a **single write of a single reference** — there's no compound read-modify-write on `status` itself (that compound logic is what `synchronized (show)` protects), so a full lock on the field would be overkill. `volatile` on `MovieBookingSystem.instance` plays the same role in double-checked locking: it prevents another thread from seeing a half-constructed singleton.
+
+### Q6. Why a `ScheduledExecutorService` for lock expiry instead of a manual timer thread?
+
+When a user locks seats but abandons checkout (slow payment, closed tab), the seats must not stay `LOCKED` forever. `SeatLockManager` schedules `releaseExpiredLocks(show, seats, userId)` via `scheduler.schedule(..., LOCK_TIMEOUT_SECONDS, TimeUnit.SECONDS)` on a single-thread `ScheduledExecutorService`. That beats a hand-rolled `Thread.sleep` loop: the pool reuses one thread for *all* expiries (no thread-per-lock blowup), handles scheduling/cancellation cleanly, and shuts down gracefully via `shutdown()` → `awaitTermination` → `shutdownNow`. The release task is idempotent and safe because it re-checks ownership (`userId.equals(showLocks.get(seat))`) **and** that the seat is still `LOCKED` — so if the booking already completed (seat now `BOOKED`), the expiry is a harmless no-op and never clobbers a confirmed booking. It runs inside the same `synchronized (show)`, so it can't interleave with an in-flight `lockSeats`/`unlockSeats`.

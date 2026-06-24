@@ -395,6 +395,22 @@ Two clean options, both keep the `EvictionPolicy` strategy intact:
 
 Don't fold TTL into `EvictionPolicy` -- TTL is *time-based eviction*, which is a different concern from *access-based eviction*. Mixing them violates SRP.
 
+### Concurrency questions (asked whenever your code uses `synchronized`)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `synchronized` on `get` / `put` in `Cache` they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q15. Why is `synchronized` on `get` **and** `put`, not just `put`?
+
+Because in `Cache`, **a `get` is also a write**. `Cache.get` calls `policy.keyAccessed(key)`, which splices a `Node` to the head of `LRUEvictionPolicy`'s doubly linked list (or bumps a `freqBuckets` entry in `LFUEvictionPolicy`). That mutation races exactly like `put` does, so `get` needs the same lock. This is why a plain "read lock" or a `ConcurrentHashMap` on `data` is insufficient -- there is no truly read-only operation here, so guarding only the writes leaves the recency bookkeeping unprotected.
+
+### Q16. Why one lock over **both** `data` and `policy` instead of locking each separately?
+
+Because `Cache` maintains an invariant *across two structures*: the keys in the `data` HashMap must exactly match the keys the `policy` tracks (its DLL / freq buckets). A `put` does "evict victim from `data`, tell `policy.keyRemoved`, insert new key, tell `policy.keyAdded`" -- those steps must move together atomically. Two independently-locked concurrent structures would let a second thread observe `data` and `policy` mid-transaction (one updated, the other not) and pick a victim that no longer exists. The single `synchronized` monitor on `Cache` makes the whole compound operation one critical section, so the two structures can never diverge.
+
+### Q17. The cache is correct but contended -- how would you reduce lock contention?
+
+The standard move is **lock striping / sharding**: split into N independent `Cache` shards keyed by `hash(key) % N` (how `ConcurrentHashMap` and Caffeine scale), so unrelated keys never block each other while each shard keeps its own coarse `synchronized` lock over its `data` + `policy`. A `ReentrantReadWriteLock` is the usual second suggestion, but note the catch from Q15: **a `get` here still writes** (it reorders recency), so most reads would have to take the write lock anyway -- an RW-lock helps far less than usual and can even be slower due to its bookkeeping overhead. Sharding is the better answer for this design.
+
 ---
 
 ## Follow-Up: Why Not `ConcurrentHashMap`? (Common Interview Question)

@@ -348,3 +348,23 @@ parking-lot/
 - **New vehicle type** → add enum value in `VehicleSize` + new subclass extending `Vehicle`
 - **New fee logic** → implement `FeeStrategy` interface
 - **Entry/exit gates, observer pattern, payment** — all plug in cleanly without modifying existing classes
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `volatile` or `synchronized`)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `private static volatile ParkingLot instance` in `ParkingLot` or the `synchronized parkVehicle(...)` chain, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. Why is `parkVehicle()` `synchronized` on `ParkingFloor` (and `park()` on `ParkingSpot`)?
+
+Because finding a spot and claiming it is a **check-then-act** sequence: `ParkingFloor.parkVehicle()` calls `findAvailableSpot()` and *then* calls `spot.park()`. Without the lock, two threads could both see the same `ParkingSpot` pass `isAvailable()` and both call `park()` on it — two cars assigned to one spot. The `synchronized` keyword makes the find-and-claim **atomic** rather than relying on a non-atomic `available` boolean read followed by a separate write. An `AtomicBoolean` with CAS on the spot would also work, but `synchronized` keeps the compound floor-level operation correct, which a per-field atomic alone cannot guarantee.
+
+### Q2. Why `volatile` on the singleton `instance` in double-checked locking?
+
+In `ParkingLot`, `instance = new ParkingLot()` is not atomic — it allocates, constructs, then assigns the reference. Without `volatile`, the JIT can **reorder** so the reference is published *before* the constructor finishes, letting another thread reading the first (un-synchronized) `if (instance == null)` check return a **half-constructed** object. `volatile` forbids that reordering and guarantees safe publication. We use it instead of synchronizing all of `getInstance()` because the first null-check keeps the lock off the **hot path** — only the very first callers ever contend.
+
+### Q3. Why lock per-floor / per-spot instead of one global lock on `ParkingLot`?
+
+To reduce **contention**. `ParkingSpot.park()`/`unpark()` are synchronized on the spot, and `ParkingFloor.parkVehicle()` on the floor, so two cars parking on **different floors don't block each other** — they take different locks. If everything funneled through a single lock on `ParkingLot`, the whole lot would serialize to one car at a time, killing throughput. The trade-off is finer-grained reasoning (you must ensure the floor lock fully covers its check-then-act), but the concurrency win is worth it for a high-traffic lot. Note `ParkingLot.parkVehicle()` is itself `synchronized` today; the natural next step is to drop that outer lock and rely on the floor/spot locks once the iteration is made lock-free.

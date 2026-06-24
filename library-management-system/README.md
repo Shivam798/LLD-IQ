@@ -412,3 +412,20 @@ The chosen granularity: per-copy locking. Two different copies (even of the same
 - **Fines / overdue policy** → `Loan.isOverdue()` is already exposed — add a `FinePolicy` strategy, run a daily sweep over `TransactionService.activeLoans`
 - **Per-member borrow limits** → extract `Member.canBorrowMore()` into a `BorrowingPolicy` strategy injected per member (e.g. students vs faculty)
 - **Reservation expiry** → store hold timestamp in the queue, prune in a background task
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `synchronized` or a `Concurrent*` / `CopyOnWrite*` collection)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `LibraryManagementSystem.catalog` as a `ConcurrentHashMap` or the three `synchronized` methods on `BookCopy`, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q. Why `ConcurrentHashMap` for `catalog`, `members`, `copies` (and `TransactionService.activeLoans`) instead of `HashMap` or `Collections.synchronizedMap`?
+A plain `HashMap` corrupts under concurrent writes (resize can spin or lose entries) — multiple librarians registering items and members hit these maps at once. `Collections.synchronizedMap` is safe but wraps **every** operation in one lock, so concurrent lookups serialize. `ConcurrentHashMap` uses **lock-striping / bucket-level CAS**, so unrelated reads and writes proceed in parallel — exactly right for a read-mostly catalog hammered by lookups during `checkout`, `returnItem`, and `search`.
+
+### Q. Why `CopyOnWriteArrayList` for `LibraryItem.holdQueue` (and `copies` / `Member.activeLoans`) instead of a plain or synchronized list?
+The hold queue is **read-heavy, write-rare**: it's iterated on every `notifyObservers()` but only mutated when someone places or clears a hold. `CopyOnWriteArrayList` gives lock-free **snapshot iteration**, so a returning copy can notify the queue even if an observer self-removes mid-notification — no `ConcurrentModificationException`. The cost is an O(n) array copy on every write, which is fine here but would be wrong for a write-heavy list (e.g. a per-request event stream), where you'd reach for a `ConcurrentLinkedQueue` or an explicit lock.
+
+### Q. Why are `BookCopy.checkout` / `returnItem` / `placeHold` `synchronized` when the maps are already concurrent?
+Because checkout is a **check-then-act**: the state object first asks "is this copy available?" and then marks it borrowed. Two members calling `checkout` on the **same** `BookCopy` could both pass the `AvailableState` check before either transitions to `CheckedOutState`, double-lending one physical copy. A `ConcurrentHashMap` only makes each individual `put`/`get` atomic — it does **nothing** to make that read-decide-write sequence atomic. The `synchronized` keyword on `BookCopy` serializes the whole compound operation per copy, so the state-transition plus its side effects happen as one indivisible step. Note the granularity: the lock is per `BookCopy`, so two **different** copies (even of the same book) still check out in parallel.

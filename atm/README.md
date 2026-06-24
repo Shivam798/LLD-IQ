@@ -389,3 +389,27 @@ atm/
 - **New state** → implement `ATMState` (e.g., `MaintenanceState`, `OutOfCashState`)
 - **New authentication method** → extend `BankingService.authenticate()` (e.g., biometric, OTP)
 - **Transaction logging** → add observer pattern to notify on each transaction event
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `volatile`, `Atomic*`, or `synchronized`)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `synchronized` on `Account.withdraw()`, the `ConcurrentHashMap` maps inside `BankingService`, or `volatile static ATM instance`, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. `Account.deposit()` and `Account.withdraw()` are `synchronized` — why, and why not just make `balance` `volatile`?
+
+Both methods do a **read-modify-write** on `balance` (`withdraw` reads `balance`, compares to `amount`, then subtracts). That compound action must be **atomic** — two ATMs hitting the same joint account must not both read $700, both pass the `balance >= amount` check for $500, and both subtract. `synchronized` makes the whole check-then-update one indivisible critical section. **`volatile` only guarantees visibility of a single read or write** — it would not stop the two threads from interleaving between the read and the write, so the lost-update race would still happen.
+
+### Q2. `BankingService` uses `ConcurrentHashMap` for `accounts`, `cards`, and `cardAccountMap` — why not a plain `HashMap` or `Collections.synchronizedMap`?
+
+Many ATMs hit the one `BankingService` concurrently, so a plain **`HashMap` is unsafe** — concurrent `put` during resize can corrupt the bucket array or spin into an infinite loop. `Collections.synchronizedMap` is safe but wraps **every** operation in one lock, serializing all readers and writers. **`ConcurrentHashMap`** uses fine-grained bucket-level locking (CAS + per-bin synchronization), so lookups like `getCard()` scale across threads — and these maps are read far more than written, which is exactly the access pattern it optimizes.
+
+### Q3. The singleton field is `private static volatile ATM instance` — what does `volatile` buy you in the double-checked locking in `getInstance()`?
+
+It guarantees both **visibility** and ordering. Without `volatile`, one thread could see a **non-null but half-constructed** `instance`: the JVM is free to publish the reference before the `ATM()` constructor finishes initializing `bankingService`/`cashDispenser`, and another thread doing the first (un-synchronized) `if (instance == null)` check would return that broken object. `volatile` forbids that reordering and forces every read to go to main memory, so once `instance` is published it is fully built. The `synchronized (ATM.class)` block still does the actual mutual exclusion; `volatile` is what makes the outer lock-free fast-path correct.
+
+### Q4. `CashDispenser.dispenseCash()` and `canDispenseCash()` are both `synchronized` on the same object — why does both matter?
+
+Because the real race is **TOCTOU** (time-of-check to time-of-use) across the two calls. A caller does `canDispenseCash(500)` then `dispenseCash(500)`; if two threads interleave, both can see "yes" against the same shared note inventory in the chain and then both dispense, draining the machine below zero. Marking both methods `synchronized` puts them under one intrinsic lock on the `CashDispenser` instance, so the check and the dispense for a given withdrawal are serialized against any other thread's check-or-dispense — the entire chain mutation is guarded by a single outer lock.

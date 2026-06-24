@@ -340,3 +340,27 @@ The chosen granularity is service-level synchronization for *mutating* operation
 - **Subset-sum optimal simplification** (strictly fewer than N-1 transactions when balances form cancellable cycles) → replace the greedy in `simplifyGroupDebts` with the NP-hard subset-sum variant, behind a flag
 - **Concurrent fine-grained locking** → replace the service `synchronized` with a per-pair lock keyed by `(min(idA,idB), max(idA,idB))` so unrelated expenses don't block each other
 - **Notifications** (e.g. "you've been added to a group", "X paid for Y") → introduce an Observer hierarchy on `User` and notify on every `createExpense` / `settleUp`
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `volatile`, `synchronized`, or a `Concurrent*` collection)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `private static volatile SplitwiseService instance` and the `synchronized` on `createExpense` / `settleUp`, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. Why `synchronized` on `createExpense` / `settleUp` when the balance maps are already `ConcurrentHashMap`?
+
+A `ConcurrentHashMap` makes each single `balances.merge(...)` atomic, but recording one expense updates **two** sheets — `paidBy.getBalanceSheet().adjustBalance(participant, amount)` *and* `participant.getBalanceSheet().adjustBalance(paidBy, -amount)` (and a multi-participant expense does this for every split). These mirrored debits/credits must all apply together or none at all. Without the service-level lock another thread could observe a half-applied state — one side debited, the matching credit not yet written — so the two `BalanceSheet`s would disagree about who owes whom. The map's per-entry atomicity simply doesn't extend to a multi-entry transaction.
+
+### Q2. Why `ConcurrentHashMap` for `users`, `groups`, and `BalanceSheet.balances` instead of `HashMap` or `Collections.synchronizedMap`?
+
+`addUser` / `addGroup` and read paths like `showBalanceSheet` and `simplifyGroupDebts` run concurrently from many threads, so a plain `HashMap` is out — a concurrent `put` during resize can corrupt buckets or spin forever. `ConcurrentHashMap` allows lock-free reads and lock-striped writes, so the read-heavy paths (balance views, simplification queries) never block. `synchronizedMap` would serialize *every* read behind one lock, killing exactly the concurrency we want; `ConcurrentHashMap` only contends at the bucket level and gives atomic `merge` for the per-entry update in `adjustBalance`.
+
+### Q3. Why is `instance` marked `volatile` in the double-checked-locking singleton?
+
+`getInstance()` does the classic double-checked lock — an outer null-check outside `synchronized` to skip the lock on the hot path, an inner one inside. Without `volatile`, the write `instance = new SplitwiseService()` can be **reordered**: a thread could publish a non-null reference before the constructor's field writes (`users`, `groups`) are visible, so a second thread passing the outer check would hand back a partially-constructed object. `volatile` forbids that reordering and guarantees the happens-before visibility, making the lock-free fast path safe.
+
+### Q4. Follow-up — why does updating two balance entries need *one* lock, and what's the deadlock risk?
+
+The invariant is consistency: a debit on `paidBy`'s sheet and the matching credit on `participant`'s sheet must be one atomic step, so no reader ever sees a partial update — that's why a single `synchronized` boundary on the service wraps the whole mirrored write rather than relying on two independent `adjustBalance` calls. The finer-grained alternative — a per-account lock on each `BalanceSheet` — introduces a **lock-ordering hazard**: thread A locks (Alice, Bob) while thread B locks (Bob, Alice), and they deadlock. The fix is a consistent global lock order (e.g. always acquire by sorted `user.getId()`), which is exactly why the coarse service-level lock is the safer default at interview scale, with per-pair sorted-key locks noted as the scaling step.

@@ -548,3 +548,23 @@ The `ConcurrentHashMap` entry stays around forever, holding a (mostly idle) stra
 ### Q13. Could you use `ConcurrentHashMap.compute` to do the whole rate-limit check atomically?
 
 You could, and it would even work — the lambda passed to `compute` runs under the hashmap's per-bin lock, so the strategy state would be updated atomically without `synchronized` inside the strategy. But it forces the strategy to be a "pure function of state" which is awkward for clock-reading algorithms, and it holds a CHM bin lock across the entire algorithm — which can block unrelated keys that happen to hash into the same bin. The `computeIfAbsent + synchronized inside strategy` split is cleaner: CHM only locks during lookup, the strategy locks during the actual decision. Different responsibilities, different locks, lower contention.
+
+### Concurrency questions (asked whenever your code uses `synchronized` or a `Concurrent*` collection)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `synchronized boolean allow()` on every strategy and the `ConcurrentHashMap<String, RateLimitStrategy> perClient` in `RateLimiter`, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q14. Why is each strategy's `allow()` declared `synchronized`?
+
+Because every strategy's body is a **read-modify-write** on its own mutable state, and the read, the modify, and the write must be one indivisible step. In `TokenBucketStrategy` it's `refill()` then read `tokens`, check `>= 1.0`, decrement — in `FixedWindowCounterStrategy` it's roll-`windowStart`-and-reset-`count`, check `count < maxRequests`, then `count++` — in `SlidingWindowLogStrategy` it's evict-stale-from-`hitTimestamps` then size-check then append. Without the lock, two requests for the same client interleave: both see the last slot free and both take it. That's the **lost-update / over-admit race** — the limiter admits past its own limit, which is the one bug that makes a rate limiter pointless. One lock around the whole sequence closes it.
+
+### Q15. Why isn't a single `AtomicLong` count enough instead of `synchronized`?
+
+Because refill (or window-roll, or eviction) and consume must move **together**, and an `AtomicLong` only makes *one* operation atomic. In `TokenBucketStrategy`, `refill()` computes elapsed nanos and adds tokens, then `allow()` checks and decrements — that's at least two dependent steps reading and writing `tokens` *and* `lastRefillNanos`. An `AtomicLong` could make the single decrement atomic, but two threads could still both refill-then-take past `capacity` because nothing keeps the refill+consume pair indivisible. A CAS loop could in principle bundle it, but it would have to atomically update two fields (`tokens` + `lastRefillNanos`) at once — that needs an `AtomicReference` to a snapshot object plus retry logic, far more code than one `synchronized`.
+
+### Q16. Why `ConcurrentHashMap` for `perClient` and not a `HashMap` or `Collections.synchronizedMap`?
+
+Because many **distinct** clients hit the limiter concurrently, and the create-on-first-request path must be atomic per key. `perClient.computeIfAbsent(clientId, k -> strategyFactory.get())` atomically builds a fresh strategy the first time a client appears and returns the existing one thereafter — under `ConcurrentHashMap` this happens under a per-bin lock, so two threads racing the *same* new client get one shared instance (never two). A plain `HashMap` would corrupt its internal table under concurrent puts; `Collections.synchronizedMap` would serialize *every* client through one global monitor, so client A's lookup needlessly blocks client B's. `ConcurrentHashMap` gives per-bin striping — concurrent clients proceed in parallel.
+
+### Q17. Per-key locking vs one global lock — how do the two locks compose?
+
+They cover two different contention domains. `ConcurrentHashMap` handles contention **across** clients (many threads inserting/looking up different keys, in parallel). Each strategy's `synchronized allow()` handles contention **within** one client (many threads hammering the same `clientId`, serialized). The map gives per-bucket *isolation* — client A's lock never touches client B — but isolation alone isn't safety: each bucket's own refill+consume still needs its lock, because two threads on the *same* key share one strategy instance and would otherwise race its `tokens`/`count`/`hitTimestamps`. A single global lock would be correct but would serialize unrelated clients; the two-level scheme keeps the only serialized scope at exactly "one client's own requests," which is the contention you actually want to throttle.

@@ -310,3 +310,23 @@ pub-sub-system/
 - **Replay / durable subscriptions** → store messages per topic and allow late subscribers to catch up from an offset
 - **Priority topics** → use a `PriorityBlockingQueue` in the executor for high-priority message delivery
 - **Dead letter queue** → catch delivery failures in `Topic.broadcast()` and route failed messages to a DLQ topic
+
+---
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses a `Concurrent*` / `CopyOnWrite*` collection or an `ExecutorService`)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `PubSubService.topicRegistry` typed as a `ConcurrentHashMap`, `Topic.subscribers` as a `CopyOnWriteArraySet`, and the shared `deliveryExecutor` `ExecutorService` driving `broadcast()`, they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. Why `ConcurrentHashMap` for `topicRegistry` instead of a `HashMap` + `synchronized` or `Collections.synchronizedMap`?
+
+In `PubSubService`, many threads hit the registry at once — `createTopic()` does `putIfAbsent`, while `subscribe`/`unsubscribe`/`publish` all call `getTopicOrThrow()` to read. `ConcurrentHashMap` gives lock-free reads and fine-grained (bin-level) write locking, so a `publish` on `"SPORTS"` never serializes behind a `createTopic("TECH")`. A `synchronizedMap` would funnel **every** operation through one monitor, killing the throughput that the whole async design is built for; plain `HashMap` would simply corrupt under concurrent resize. Its atomic `putIfAbsent` also makes topic creation race-free without any explicit lock.
+
+### Q2. Why `CopyOnWriteArraySet` for `Topic.subscribers` — and why the **Set**, not a `List`?
+
+`broadcast()` iterates `subscribers` on **every** published message (read-heavy), while `addSubscriber`/`removeSubscriber` are comparatively rare. COW gives lock-free snapshot iteration: a `removeSubscriber` mid-`broadcast` swaps in a fresh array, so an in-flight fan-out keeps iterating its stable snapshot and never throws `ConcurrentModificationException`. The **Set** (not `CopyOnWriteArrayList`) dedupes — subscribing the same `Subscriber` twice won't get it two copies of every message. The accepted cost is O(n) on each write, since every mutation copies the whole backing array — fine here because writes are infrequent versus the constant broadcast reads.
+
+### Q3. Why deliver via an `ExecutorService` (`deliveryExecutor`) instead of calling `onMessage()` inline in `broadcast()`?
+
+`Topic.broadcast()` submits each `subscriber.onMessage(...)` as a task to the shared pool so the **publisher thread returns immediately** — one slow subscriber (network/disk) can't block delivery to the rest or stall the publisher. A pooled `newCachedThreadPool` (created once in `PubSubService` and injected into every `Topic`) reuses and bounds threads rather than spawning a raw `new Thread` per message, which would be unbounded and uncapped. The trade-offs you must name: no cross-subscriber **ordering** guarantee, no built-in **backpressure** (an unbounded queue can grow if producers outpace consumers), and the need for explicit lifecycle management — handled by the two-phase `shutdown()` (`shutdown()` → `awaitTermination(2s)` → `shutdownNow()`) so pending deliveries drain gracefully.

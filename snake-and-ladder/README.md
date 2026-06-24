@@ -335,3 +335,29 @@ All sessions complete.
   Session-A -> winner: Charlie
   Session-B -> winner: Eve
 ```
+
+## Common Interview Questions (Rapid Fire)
+
+### Concurrency questions (asked whenever your code uses `volatile`, `synchronized`, `ThreadLocal`, or a `CopyOnWrite*` collection)
+
+> Interviewers treat these keywords as an invitation. The moment they spot `ThreadLocalRandom.current()` in `Dice.roll()`, a `volatile GameManager instance`, a `synchronized startGame()`, and a `CopyOnWriteArrayList activeGames` they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
+
+### Q1. What is `ThreadLocal` (and `ThreadLocalRandom`), and why is it used in `Dice.roll()`?
+
+`ThreadLocal` gives each thread its **own private copy** of a value — there is no shared state, so there is nothing to lock. `Dice.roll()` calls `ThreadLocalRandom.current().nextInt(...)`, which hands every game thread its **own** `Random`-like generator. With one thread per `Game`, each session rolls against an isolated RNG and never touches another session's. The win over `synchronized` is the key point: instead of *guarding* one shared object, you *eliminate sharing*, so threads never contend at all.
+
+### Q2. Why `ThreadLocalRandom` instead of `Math.random()` or a shared `Random`?
+
+`Math.random()` and a single shared `Random` are thread-**safe** but **contended** — every thread fights over one internal seed via a CAS/lock, which serializes rolls under load. `ThreadLocalRandom` keeps a per-thread seed, so concurrent sessions roll in true parallel with zero coordination. Right when each thread can have its own RNG (dice rolls don't need to agree on a value); wrong if threads had to draw from one shared, reproducible sequence.
+
+### Q3. Why is `GameManager.startGame()` `synchronized`?
+
+`startGame()` does a multi-step read-modify-write — `activeGames.add(game)`, build a `Thread`, `gameThreads.add(thread)`, then `thread.start()` — and those steps must happen as **one atomic unit**. `gameThreads` is a plain `ArrayList`, so two callers starting games at once could interleave and corrupt it. `synchronized` serializes the whole method so the two lists stay consistent with each other. A finer-grained alternative (locking each list separately) wouldn't keep the *pair* of updates atomic.
+
+### Q4. Why is the singleton `instance` field `volatile`?
+
+`instance` is read on the hot path **without** a lock (double-checked locking), so it must be `volatile` to guarantee **visibility** and to forbid reordering: a writer assigning `instance = new GameManager()` must publish the **fully-constructed** object, never a half-initialized reference. Without `volatile`, another thread could see a non-null but partially-built instance. The `synchronized (GameManager.class)` block still does the actual mutual exclusion on first init; `volatile` is what makes the unlocked read safe.
+
+### Q5. Why is `activeGames` a `CopyOnWriteArrayList`?
+
+`activeGames` is **read-heavy, write-rare** — games are added occasionally in `startGame()`, but `getActiveGames()` may iterate at any time from other threads. `CopyOnWriteArrayList` lets readers take a lock-free **snapshot** that never throws `ConcurrentModificationException` while a write swaps in a fresh copy underneath. Chosen over a `synchronized` list (readers would block) or `Collections.synchronizedList` (iteration still needs external locking). The trade-off — every write copies the whole array — is fine here because writes are infrequent.

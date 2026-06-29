@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.lld</groupId>
+        <artifactId>lld-interview-questions</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>task-scheduler</artifactId>
+    <packaging>jar</packaging>
+
+    <name>Task Scheduler</name>
+    <description>Low Level Design - Cron-like Task Scheduler (pluggable schedules, priority queue, worker pool)</description>
+
+    <properties>
+        <main.class>com.taskscheduler.TaskSchedulerDemo</main.class>
+    </properties>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <version>3.3.0</version>
+                <configuration>
+                    <archive>
+                        <manifest>
+                            <mainClass>${main.class}</mainClass>
+                        </manifest>
+                    </archive>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

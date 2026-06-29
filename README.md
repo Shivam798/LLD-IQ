@@ -19,6 +19,8 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 11 | LRU Cache (with LFU strategy variant) | [`lru-cache/`](lru-cache/) |
 | 12 | Rate Limiter (with Token Bucket / Sliding Window strategies) | [`rate-limiter/`](rate-limiter/) |
 | 13 | Notification Service (multi-channel: Email / SMS / Push) | [`notification-service/`](notification-service/) |
+| 14 | Meeting Room Booking (interval overlap + allocation strategy) | [`meeting-room-booking/`](meeting-room-booking/) |
+| 15 | Task Scheduler (cron-like: priority queue + dispatcher + worker pool) | [`task-scheduler/`](task-scheduler/) |
 
 ## Common Resources
 

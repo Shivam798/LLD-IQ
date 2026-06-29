@@ -243,6 +243,26 @@ It's the root cause. Each core caches fields locally, so without sync one core's
 **Q: Difference between scheduling and preemption for priority?**
 Scheduling reorders what's *waiting*; preemption interrupts what's *running*. Real systems do the former (priority queue), not the latter.
 
+### Task Scheduler (cron-like) — see [`task-scheduler/`](task-scheduler/)
+
+**Q: Why a `ReentrantLock` + `Condition` for the dispatcher instead of `Thread.sleep(untilDue)`?**
+The dispatcher must sleep until the soonest task is due, but a *newly submitted* task that's due sooner has to wake it early. `Thread.sleep` can't be cancelled cleanly; a timed `condition.await(delay)` can — every queue mutation calls `signalAll()` so the dispatcher recomputes the nearest deadline. This is the `DelayQueue`/`ScheduledThreadPoolExecutor` leader-wait pattern.
+
+**Q: Why `signalAll()` after every `schedule`/`cancel`/reschedule?**
+Because the change may have produced a new earliest task (or removed the current one). The dispatcher is waiting on a deadline computed from the *old* head; signalling forces it to re-peek and wait on the correct one.
+
+**Q: Why a separate worker pool — why not run the job on the dispatcher thread?**
+A single slow job would block every future tick. The dispatcher only *decides when* and hands the task to an `ExecutorService` that *does the work* concurrently. Deciding-when is decoupled from doing-the-work.
+
+**Q: The `Task` fields are `volatile` but not atomic — is that a race?**
+No. `status`/`nextExecutionTime`/`runCount` are written by a worker and read by the dispatcher, so they need `volatile` for visibility — but they're only ever *mutated* while the scheduler holds its lock, so there's no read-modify-write interleaving. `volatile` for cross-thread visibility, the lock for the compound update.
+
+**Q: Why must you never change a task's fire time while it's in the `PriorityQueue`?**
+A binary heap's ordering invariant breaks if a key changes underneath it — the element ends up in the wrong position and `poll()` returns the wrong minimum. So `nextExecutionTime` is only mutated while the task is *out* of the heap (before first `add`, or after `poll` and before re-`add`).
+
+**Q: Why `PriorityQueue` guarded by a lock instead of `PriorityBlockingQueue`?**
+`PriorityBlockingQueue` gives thread-safe `put`/`take`, but the dispatcher needs a *timed, signal-interruptible* wait tied to the head's deadline plus atomic "peek-then-decide-then-maybe-poll". Owning one explicit lock + condition over a plain heap expresses that precisely; the blocking queue would still need external coordination for "wake when a sooner task arrives".
+
 ---
 
 ## Cheat Sheet — Which Tool?

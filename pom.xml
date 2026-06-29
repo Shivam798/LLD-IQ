@@ -32,6 +32,8 @@
         <module>lru-cache</module>
         <module>rate-limiter</module>
         <module>notification-service</module>
+        <module>meeting-room-booking</module>
+        <module>task-scheduler</module>
     </modules>
 
     <build>

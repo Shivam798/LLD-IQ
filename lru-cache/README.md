@@ -1,6 +1,6 @@
 # LRU Cache — Low Level Design
 
-A fixed-capacity, generic, thread-safe in-memory cache with **pluggable eviction policies** (LRU and LFU implemented out of the box).
+A fixed-capacity, generic, thread-safe in-memory cache with **pluggable eviction policies** (LRU, LFU and FIFO out of the box — plus a five-line `LinkedHashMap` LRU for contrast) and **optional per-entry TTL**.
 
 ---
 
@@ -11,8 +11,18 @@ Design an in-memory cache that:
 - Supports `get(key)`, `put(key, value)`, `remove(key)` in **O(1)**
 - When full, evicts one entry to make room for a new key
 - Allows the eviction policy to be swapped without touching the cache itself
-- Ships with two ready policies: **Least Recently Used (LRU)** and **Least Frequently Used (LFU)**
+- Ships with three ready policies -- **Least Recently Used (LRU)**, **Least Frequently Used (LFU)**, **First In First Out (FIFO)** -- plus a `LinkedHashMap`-backed LRU that shows the library shortcut
+- Supports **time-to-live**: a cache-wide default TTL, overridable per entry, with entries expiring whether or not the cache is full
 - Is safe to call from multiple threads
+
+**The two exit doors.** An entry leaves for one of two unrelated reasons, and the design keeps them apart:
+
+| | Question it answers | Who decides | Where it lives |
+|---|---|---|---|
+| **Eviction** | "We are FULL — who leaves?" | `EvictionPolicy` (LRU / LFU / FIFO) | `strategy/` |
+| **Expiry (TTL)** | "Is this entry still TRUE?" | the clock | `CacheEntry` + `Cache` |
+
+A cache with free space must still refuse to serve a stale entry, so TTL cannot live inside a policy that only speaks up when the cache is full.
 
 ---
 
@@ -23,28 +33,43 @@ cache.get(key)
     |
     +-- data.get(key)
     |        |
-    |        +-- miss --> return Optional.empty()
+    |        +-- miss     --> return Optional.empty()
     |        |
-    |        +-- hit  --> policy.keyAccessed(key) --> return Optional.of(value)
+    |        +-- EXPIRED  --> drop(key)  [data.remove + policy.keyRemoved]
+    |        |                --> return Optional.empty()      (stale never counts as a hit)
+    |        |
+    |        +-- hit      --> policy.keyAccessed(key) --> return Optional.of(value)
     |
-cache.put(key, value)
+cache.put(key, value[, ttl])
+    |
+    +-- entry = new CacheEntry(value, ttl == null ? null : now + ttl)
     |
     +-- data.containsKey(key)?
     |        |
-    |        +-- yes --> data.put(key, value); policy.keyAccessed(key); return
+    |        +-- yes --> data.put(key, entry); policy.keyAccessed(key); return
+    |        |           (an UPDATE: TTL restarts, nobody is evicted, no new policy node)
     |        |
     |        +-- no
     |              |
     |              +-- data.size() == capacity?
     |              |        |
-    |              |        +-- yes --> K victim = policy.selectEvictionCandidate()
-    |              |                    data.remove(victim); policy.keyRemoved(victim)
+    |              |        +-- yes --> purgeExpired(now)      (reclaim the dead first...)
     |              |
-    |              +-- data.put(key, value); policy.keyAdded(key)
+    |              +-- data.size() == capacity?
+    |              |        |
+    |              |        +-- yes --> K victim = policy.selectEvictionCandidate()
+    |              |                    drop(victim)           (...only then kill a live one)
+    |              |
+    |              +-- data.put(key, entry); policy.keyAdded(key)
     |
 cache.remove(key)
     |
     +-- data.remove(key) != null --> policy.keyRemoved(key)
+    |
+cache.purgeExpired()
+    |
+    +-- now = clock.instant()                (read ONCE, judge every entry against it)
+    +-- collect expired keys, then drop(k) for each
 ```
 
 ---
@@ -62,14 +87,31 @@ classDiagram
 
     class Cache~K, V~ {
         -capacity: int
-        -data: HashMap~K, V~
+        -data: HashMap~K, CacheEntry~V~~
         -policy: EvictionPolicy~K~
+        -defaultTtl: Duration «nullable»
+        -clock: Clock «injected»
         +Cache(int, EvictionPolicy~K~)
+        +Cache(int, EvictionPolicy~K~, Duration)
+        +Cache(int, EvictionPolicy~K~, Duration, Clock)
         +get(K) Optional~V~ «sync»
         +put(K, V) «sync»
+        +put(K, V, Duration) «sync»
         +remove(K) boolean «sync»
+        +purgeExpired() int «sync»
         +size() int «sync»
         +capacity() int
+        -drop(K)
+        -purgeExpired(Instant) int
+    }
+
+    class CacheEntry~V~ {
+        <<immutable>>
+        -value: V
+        -expiresAt: Instant «null = never»
+        +value() V
+        +expiresAt() Instant
+        +isExpired(Instant) boolean
     }
 
     class EvictionPolicy~K~ {
@@ -110,9 +152,28 @@ classDiagram
         -recomputeMinFreq()
     }
 
+    class LinkedHashMapLRUEvictionPolicy~K~ {
+        -order: LinkedHashMap~K, Boolean~ «accessOrder=true»
+        +keyAdded(K)
+        +keyAccessed(K)
+        +keyRemoved(K)
+        +selectEvictionCandidate() K
+    }
+
+    class FIFOEvictionPolicy~K~ {
+        -insertionOrder: LinkedHashSet~K~
+        +keyAdded(K)
+        +keyAccessed(K) «no-op by design»
+        +keyRemoved(K)
+        +selectEvictionCandidate() K
+    }
+
     LRUEvictionPolicy ..|> EvictionPolicy
     LFUEvictionPolicy ..|> EvictionPolicy
+    FIFOEvictionPolicy ..|> EvictionPolicy
+    LinkedHashMapLRUEvictionPolicy ..|> EvictionPolicy
     Cache --> EvictionPolicy : policy
+    Cache *-- CacheEntry : data values
     LRUEvictionPolicy *-- Node : nodeMap values
 ```
 </details>
@@ -201,9 +262,43 @@ On `keyAccessed`, the key moves from `bucket[f]` to `bucket[f+1]`. On eviction, 
 
 **Interview power move**: *"LFU is where most candidates trip up -- they use a single TreeMap and end up at O(log n). The trick is two HashMaps and a tracked minimum frequency. Now every operation is O(1), and the LinkedHashSet inside each bucket gives me LRU as a free tiebreaker."*
 
-### Layer 6: The orchestrator -- `Cache<K, V>`
+### Layer 6: FIFO -- the policy that proves the abstraction
 
-**What**: Holds a `HashMap<K, V>`, an `EvictionPolicy<K>`, and the `capacity`. Every public method is `synchronized`. On `put`, if the cache is full it asks the policy who to evict, removes that key, then inserts the new one.
+**What**: One `LinkedHashSet<K>` in arrival order. `keyAdded` appends to the back, `selectEvictionCandidate` returns the front, `keyRemoved` unlinks, and **`keyAccessed` does nothing at all**.
+
+**Why the empty method is the whole point**: FIFO is defined by *when a key arrived*, never by how it was used. A key read a million times is still evicted the moment it becomes the oldest arrival. That deliberate no-op is what separates FIFO from LRU -- and it is the cheapest possible read path, because the hot path (`get`) does zero bookkeeping.
+
+**Why it's the best proof that Layer 2 was right**: FIFO took ~15 lines and *zero* edits to `Cache`. If eviction logic had been fused into the cache, adding FIFO would have meant surgery on the class every other feature also depends on. This is Open/Closed demonstrated, not just claimed.
+
+**Why `LinkedHashSet` and not `ArrayDeque`**: `ArrayDeque` gives O(1) `addLast`/`peekFirst`, but a manual `cache.remove(key)` has to delete an *arbitrary* key from the middle -- O(n) scan on a deque. `LinkedHashSet` is a hash set backed by a linked list of its entries: O(1) add, O(1) remove of any key, and iteration in insertion order. Every hook stays O(1).
+
+**The trap to avoid**: don't "helpfully" re-insert the key in `keyAccessed`. `LinkedHashSet.add` on an existing key is a no-op, so it *looks* harmless -- but the moment someone "fixes" it to remove-then-add, FIFO silently becomes LRU. The empty body deserves a comment saying it is intentional.
+
+**Mental model**: a queue at a ticket counter where nobody can cut the line. Being popular doesn't move you; only arriving later does.
+
+**Interview power move**: *"FIFO's `keyAccessed` is intentionally empty -- that single no-op is the entire definition of the policy. And notice it needed no changes to `Cache` whatsoever; that's the payoff of the strategy split I made in the first two minutes."*
+
+### Layer 7: TTL -- the second exit door, and why it is NOT a policy
+
+**What**: Values are stored wrapped in an immutable `CacheEntry<V>` holding the value plus an absolute `expiresAt` instant (`null` = never). `Cache` takes an optional cache-wide `defaultTtl`, `put(k, v, ttl)` overrides it per entry, and an injected `java.time.Clock` supplies "now".
+
+**Why TTL does not belong in `EvictionPolicy`**: eviction and expiry answer different questions. Eviction answers *"we are full -- who leaves?"*; TTL answers *"is this entry still true?"* A cache with plenty of free space must still refuse to serve a stale entry, so expiry cannot live in a component that only gets consulted under capacity pressure. Keeping it on the stored entry means **LRU, LFU, FIFO and any policy written next year get TTL for free**, with no changes and no duplicated logic. Folding it into the four-method interface would force every implementation to reimplement the same clock check -- a straight SRP violation.
+
+**Why an absolute `expiresAt`, not a stored duration**: storing "expires at 10:04:31.2Z" makes the check one comparison against the clock. Storing "lives 5 minutes" forces arithmetic on every read and makes the answer depend on *when* the check happens to run.
+
+**Why an injected `Clock`**: it is the standard Java seam for time. Tests hand in a fixed or hand-cranked clock and step time forward deterministically; without the seam every TTL test needs `Thread.sleep` and is both slow and flaky. `LruCacheDemo` uses a 20-line `SteppableClock` for exactly this reason -- the TTL demo runs instantly and always prints the same output.
+
+**Why lazy expiry, not a sweeper thread**: expiry is enforced on read (an expired entry is a miss and is deleted on the spot) and opportunistically on write (a full cache purges dead entries *before* it evicts a live one). No background thread means no extra thread to lock, size, or shut down. The cost is that an expired entry nobody touches again occupies memory until something bumps into it -- which is precisely the trade-off Guava and Caffeine make. `purgeExpired()` is exposed for callers who want to reclaim eagerly.
+
+**The ordering detail interviewers look for**: in `get`, the expiry check comes **before** `policy.keyAccessed`. Reading a stale entry must not count as a hit, or a dead key would be promoted to most-recently-used and outlive live ones. Likewise `put` on a full cache calls `purgeExpired` first -- letting an entry that died an hour ago push out a key written a second ago is defensible by the letter of the policy and indefensible in an interview.
+
+**Why the expired entry is deleted on read rather than just skipped**: a key that is polled forever but never rewritten would otherwise leak permanently.
+
+**Interview power move**: *"I'd push back on modelling TTL as an eviction policy. Eviction is about space, TTL is about truth -- a cache that's half empty still can't serve a stale value. So expiry rides on the stored entry and every policy inherits it for free. I'd inject a `Clock` rather than calling `Instant.now()`, so TTL is testable without sleeping."*
+
+### Layer 8: The orchestrator -- `Cache<K, V>`
+
+**What**: Holds a `HashMap<K, CacheEntry<V>>`, an `EvictionPolicy<K>`, the `capacity`, an optional `defaultTtl` and a `Clock`. Every public method is `synchronized`. On `put`, if the cache is full it first purges expired entries, then asks the policy who to evict, removes that key, and inserts the new one.
 
 **Why so thin**: The cache is a coordinator, not a doer. It knows nothing about access order, frequency counts, or eviction heuristics. It only knows: "I have a HashMap. If I'm full and a new key comes in, I ask the policy who to drop." This is exactly the same shape as `ParkingLot` in the parking-lot module -- a thin orchestrator that delegates everything.
 
@@ -215,33 +310,57 @@ On `keyAccessed`, the key moves from `bucket[f]` to `bucket[f+1]`. On eviction, 
 
 **Interview power move**: *"The Cache class has zero policy logic. If you grep it for `LRU` or `LFU`, you'll find nothing. That's the whole point -- the cache and the policy evolve independently."*
 
-### Layer 7: Why this design beats `LinkedHashMap` (a question interviewers love to ask)
+### Layer 9: The five-line `LinkedHashMap` version -- ship it, but never lead with it
 
-**The naive answer**: "Just use `LinkedHashMap` with `accessOrder=true` and override `removeEldestEntry`."
+**What**: `LinkedHashMapLRUEvictionPolicy` is the same LRU with the same complexity and the same eviction order, in five lines of real logic:
 
-**Why that's not enough**: It works for LRU, but:
-- It hardcodes you to LRU forever -- you can't swap in LFU
-- It's not thread-safe -- you'd wrap it in `Collections.synchronizedMap`, but the iteration order during `removeEldestEntry` is still LRU-only
-- The interviewer is testing whether you understand the *mechanism*, not just whether you can use the library
+```java
+private final LinkedHashMap<K, Boolean> order = new LinkedHashMap<>(16, 0.75f, true);
 
-**Interview power move**: *"`LinkedHashMap` with `accessOrder=true` is a perfectly fine production answer for LRU specifically, but it's a black box -- you can't pivot to LFU or any other policy. The hand-rolled design here is what I'd reach for if I were building a real cache library."*
+public void keyAdded(K key)    { order.put(key, Boolean.TRUE); }
+public void keyAccessed(K key) { order.get(key); }              // get() reorders — that IS the promotion
+public void keyRemoved(K key)  { order.remove(key); }
+public K selectEvictionCandidate() {
+    return order.isEmpty() ? null : order.keySet().iterator().next();   // head = LRU
+}
+```
+
+The third constructor argument, `accessOrder = true`, is the entire policy. It flips `LinkedHashMap` from insertion-order to access-order, so every `get`/`put` re-threads that entry to the most-recently-used end and the head of the iteration order is always the LRU key. Flip that one boolean to `false` and this class silently becomes FIFO -- LRU and FIFO really are one boolean apart.
+
+**Why it exists in this repo**: it drops into the same `Cache` and produces byte-identical demo output to the hand-rolled policy. That is the point: the `EvictionPolicy` interface is the boundary, so the algorithm underneath is free to be a hand-rolled DLL *or* a JDK class.
+
+**Why you must not open with it in an interview**: "implement an LRU cache" is not a request for a cache. It is a request to build the doubly-linked-list-plus-hashmap structure that makes O(1) recency possible -- and `LinkedHashMap` **is** a HashMap whose entries are threaded onto a doubly linked list. Handing it over means the library performs the exact demonstration you were being graded on, and none of the reasoning (why a DLL and not a singly linked list, why sentinels, why a key->node map) ever gets said out loud. It reads as avoidance.
+
+Two further weaknesses if the interviewer pushes:
+- The famous one-class variant (`class LRUCache<K,V> extends LinkedHashMap<K,V>` overriding `removeEldestEntry`) hardcodes you to LRU forever -- there is no seam to swap in LFU or FIFO. The policy version above at least keeps the seam.
+- It is not thread-safe; `Collections.synchronizedMap` locks the map but not the cross-structure invariant between `data` and the policy (see the `ConcurrentHashMap` section below).
+
+**The right sequencing**: hand-roll the DLL first, then say the line below. Order matters -- said first it is a dodge, said second it is range.
+
+**Interview power move**: *"That's the hand-rolled version, so you can see the mechanism. In production I'd write `new LinkedHashMap<>(16, 0.75f, true)` and override `removeEldestEntry` -- accessOrder=true is exactly this doubly linked list, already implemented and battle-tested in the JDK. I've kept both in this repo behind the same interface; they produce identical output. I led with the hand-rolled one because the DLL is the part you were asking about."*
 
 ### The Full Picture
 
 ```
-Cache<K, V>                       (orchestrator -- HashMap<K,V> + capacity)
+Cache<K, V>                       (orchestrator -- capacity + defaultTtl + Clock)
+    |
+    +-- HashMap<K, CacheEntry<V>> (storage; CacheEntry = value + absolute expiresAt)
+    |        ^
+    |        +-- TTL / expiry lives HERE, not in the policy  ("is this still true?")
     |
     v
-EvictionPolicy<K>                 (interface -- 4 hook methods)
+EvictionPolicy<K>                 (interface -- 4 hook methods; "who leaves when full?")
     |
     +-- LRUEvictionPolicy<K>      (HashMap + DLL with sentinels)
     |
     +-- LFUEvictionPolicy<K>      (HashMap + freq buckets + minFreq)
     |
-    +-- <future policy>           (FIFO, MRU, ARC, 2Q -- plug in without touching Cache)
+    +-- FIFOEvictionPolicy<K>     (LinkedHashSet in arrival order; keyAccessed = no-op)
+    |
+    +-- <future policy>           (MRU, ARC, 2Q -- plug in without touching Cache)
 ```
 
-> **Interview Summary**: *"I split the design into two responsibilities -- a generic `Cache<K, V>` that owns the key-to-value HashMap, and an `EvictionPolicy<K>` strategy that owns the access-order bookkeeping. The cache calls into the policy on every event (`keyAdded`, `keyAccessed`, `keyRemoved`) and asks the policy who to evict via `selectEvictionCandidate`. The LRU policy uses a doubly linked list with sentinels plus a key->node HashMap for O(1) operations. The LFU policy uses two HashMaps -- key->frequency and frequency->LinkedHashSet of keys -- plus a tracked `minFreq`, also O(1) on every operation, with LRU as a free tiebreaker thanks to LinkedHashSet's insertion order. Every public method on the cache is synchronized because even `get` mutates policy state. The whole design is Open/Closed -- I can add FIFO, MRU, or ARC tomorrow with zero changes to `Cache`."*
+> **Interview Summary**: *"I split the design into two responsibilities -- a generic `Cache<K, V>` that owns the key-to-entry HashMap, and an `EvictionPolicy<K>` strategy that owns the access-order bookkeeping. The cache calls into the policy on every event (`keyAdded`, `keyAccessed`, `keyRemoved`) and asks who to evict via `selectEvictionCandidate`. LRU uses a doubly linked list with sentinels plus a key->node HashMap for O(1) operations. LFU uses two HashMaps -- key->frequency and frequency->LinkedHashSet of keys -- plus a tracked `minFreq`, also O(1), with LRU as a free tiebreaker thanks to LinkedHashSet's insertion order. FIFO is a single LinkedHashSet in arrival order whose `keyAccessed` is deliberately empty -- that no-op is the whole policy, and it needed zero changes to `Cache`, which is the proof the split was right. TTL is deliberately NOT a policy: eviction answers 'we're full, who leaves?', TTL answers 'is this entry still true?', so expiry rides on an immutable `CacheEntry` holding an absolute `expiresAt`, and every policy inherits it for free. Expiry is lazy -- checked on read before the access is recorded, and a full cache purges dead entries before evicting a live one -- with an injected `Clock` so it's testable without sleeping. Every public method on the cache is synchronized because even `get` mutates policy state."*
 
 ---
 
@@ -253,15 +372,18 @@ lru-cache/
 ├── README.md
 ├── class-diagram.excalidraw
 └── src/main/java/com/lrucache/
-    ├── LruCacheDemo.java                # Entry point (main)
+    ├── LruCacheDemo.java                # Entry point (main) — LRU / LFU / FIFO / update / TTL demos
     │
     ├── model/
-    │   └── Cache.java                   # Generic orchestrator — owns HashMap, delegates to policy
+    │   ├── Cache.java                   # Generic orchestrator — owns HashMap + TTL, delegates eviction
+    │   └── CacheEntry.java              # Immutable value + absolute expiresAt (null = never)
     │
     └── strategy/
         ├── EvictionPolicy.java          # Strategy interface (4 hook methods)
         ├── LRUEvictionPolicy.java       # DLL + nodeMap (Node is a private static nested class)
-        └── LFUEvictionPolicy.java       # freqMap + freq->LinkedHashSet buckets + tracked minFreq
+        ├── LFUEvictionPolicy.java       # freqMap + freq->LinkedHashSet buckets + tracked minFreq
+        ├── FIFOEvictionPolicy.java      # LinkedHashSet in arrival order; keyAccessed is a no-op
+        └── LinkedHashMapLRUEvictionPolicy.java  # Same LRU in 5 lines — ship it, don't lead with it
 ```
 
 ---
@@ -270,9 +392,12 @@ lru-cache/
 
 | Pattern | Where | Why |
 |---------|-------|-----|
-| **Strategy** | `EvictionPolicy` + `LRUEvictionPolicy` / `LFUEvictionPolicy` | Swap eviction algorithm without changing `Cache` |
+| **Strategy** | `EvictionPolicy` + `LRU` / `LFU` / `FIFO` implementations | Swap eviction algorithm without changing `Cache` |
 | **Sentinel Node** | `LRUEvictionPolicy` head/tail | Removes null checks at DLL boundaries |
+| **Adapter (of a JDK type)** | `LinkedHashMapLRUEvictionPolicy` | Wraps `LinkedHashMap(accessOrder=true)` behind the same 4-method contract — proves the interface is the boundary, not the algorithm |
 | **Composition** | `Cache` owns `EvictionPolicy` | Cache delegates ordering decisions |
+| **Value Object** | `CacheEntry<V>` (immutable value + `expiresAt`) | TTL rides on the stored entry, so every policy inherits expiry for free |
+| **Dependency Injection** | `Clock` passed into `Cache` | Makes TTL deterministic and testable without `Thread.sleep` |
 
 ---
 
@@ -280,9 +405,9 @@ lru-cache/
 
 | Principle | How |
 |-----------|-----|
-| **SRP** | `Cache` stores; `EvictionPolicy` decides order. Two reasons to change live in two classes. |
-| **OCP** | Add FIFO / MRU / ARC by adding a new `EvictionPolicy` implementation -- no edits to `Cache`. |
-| **LSP** | Anywhere `EvictionPolicy<K>` is expected, both LRU and LFU work identically. |
+| **SRP** | `Cache` stores and enforces TTL; `EvictionPolicy` decides eviction order; `CacheEntry` knows only whether it is stale. Three reasons to change, three classes. |
+| **OCP** | FIFO was added as a new `EvictionPolicy` implementation with **zero** edits to `Cache` -- MRU / ARC would be the same. |
+| **LSP** | Anywhere `EvictionPolicy<K>` is expected, LRU, LFU and FIFO are all drop-in -- including FIFO, whose `keyAccessed` does nothing (a no-op honours the contract; it does not break it). |
 | **ISP** | Interface has exactly the four methods needed to express any access-order policy -- no fat. |
 | **DIP** | `Cache` depends on `EvictionPolicy` abstraction, not on `LRUEvictionPolicy` concrete class. |
 
@@ -293,13 +418,18 @@ lru-cache/
 - All public methods on `Cache` are `synchronized` -- including `get`, because reads mutate policy state (recency/frequency tracking).
 - The policies themselves are NOT thread-safe in isolation; safety relies on the cache holding the lock around every policy call. This is a deliberate trade-off: it keeps the policies simple and avoids double-locking.
 - For a higher-concurrency variant, swap `synchronized` for a `ReentrantLock`, or shard the cache (a-la Guava `LoadingCache`) so each shard holds its own lock.
+- TTL adds no new locking: expiry is checked inside the already-synchronized `get` / `put`, and `purgeExpired()` is synchronized too. There is no sweeper thread, so there is no second thread to coordinate with.
+- Each operation reads `clock.instant()` **once** and judges every entry it touches against that single instant, so a bulk purge can never be internally inconsistent (no entry surviving because time moved mid-loop).
+- `purgeExpired` collects victim keys first and deletes afterwards -- `policy.keyRemoved` is a call into foreign code, and invoking it mid-iteration over `data` is how `ConcurrentModificationException` bugs are born.
 
 ---
 
 ## Extensibility
 
 - **New eviction policy** (FIFO, MRU, random, ARC, 2Q, ...) -> implement `EvictionPolicy<K>`. Zero changes to `Cache`.
-- **Time-based expiry (TTL)** -> wrap the value in a `TimedValue<V>` record holding the insertion time, or add an `expiresAt` field on the policy's node and have the policy purge in `selectEvictionCandidate`.
+- **Time-based expiry (TTL)** -> **built in.** Pass a `defaultTtl` to the constructor, or a per-entry TTL to `put(k, v, ttl)`. Works with every policy because expiry lives on `CacheEntry`, not in `EvictionPolicy`.
+- **Eager expiry** -> call `purgeExpired()` from a scheduler; or, for a push model, add a `DelayQueue<K>` fed on each `put` and drained by one sweeper thread that calls `cache.remove(key)`.
+- **Expire-after-access instead of expire-after-write** -> refresh `expiresAt` inside `get` as well as `put` (Guava exposes both as separate knobs).
 - **Cache statistics** (hit rate, miss rate) -> add counters on `Cache` and expose `stats()`.
 - **Listeners on eviction** -> add an `EvictionListener<K, V>` interface and call it from `Cache.put` right before `data.remove(victim)`.
 - **Higher concurrency** -> replace `synchronized` with `ReentrantLock` (allows tryLock + timeout) or shard the cache by key hash so each shard locks independently.
@@ -317,6 +447,81 @@ LFU is the natural follow-up an interviewer will ask once you finish LRU. Treat 
 **The interview-grade detail**: Frequency ties between keys are broken using LRU semantics -- the oldest entry at the lowest frequency goes first. We get this for free by using `LinkedHashSet` (which preserves insertion order) as the bucket type instead of plain `HashSet`.
 
 **When to actually use LFU in production**: LFU is rare in practice -- it has a "scan resistance" weakness (one-off bursts inflate frequency counts permanently). Real systems use **W-TinyLFU** (Caffeine library) or **ARC** (adaptive replacement cache). For an LLD interview, classic LFU is plenty -- mention W-TinyLFU as the production-grade follow-up if you have time.
+
+---
+
+## FIFO Notes
+
+FIFO is the policy interviewers use to check whether your abstraction is real or decorative. It took ~15 lines and **zero** changes to `Cache`.
+
+**The one line that matters**: `keyAccessed` is empty. FIFO orders by arrival, so reads must not reorder anything. Leave a comment saying the emptiness is deliberate, or the next person "fixes" it and silently turns FIFO into LRU.
+
+**Why `LinkedHashSet` and not `ArrayDeque`**: a deque gives O(1) at both ends but O(n) removal of an arbitrary key, which `cache.remove(key)` needs. `LinkedHashSet` is a hash set whose entries are threaded on a linked list: O(1) add, O(1) remove of any key, iteration in insertion order.
+
+**Its weakness**: no recency and no frequency awareness at all -- the hottest key in the cache is evicted the moment it becomes the oldest arrival. Its strength is the mirror image: the read path does *zero* bookkeeping, so it's the cheapest policy to run and the easiest to reason about. Real systems use it where entries are naturally uniform (fixed-size buffers, write-behind queues) or where the read path must stay allocation-free.
+
+**LRU and FIFO are one boolean apart**: `new LinkedHashMap<>(16, 0.75f, true)` is LRU; `false` (the default) is FIFO. Worth saying out loud -- it shows you know what `accessOrder` actually toggles.
+
+---
+
+## TTL Notes
+
+**The framing that wins the question**: eviction and expiry are different exit doors. Eviction answers *"we are full -- who leaves?"*; TTL answers *"is this entry still true?"* A half-empty cache must still refuse to serve a stale value, so TTL cannot live in a component only consulted under capacity pressure. That's why `expiresAt` sits on `CacheEntry` and **every policy inherits TTL for free**.
+
+**Absolute deadline, not stored duration**: `expiresAt` is an `Instant`. Checking expiry is then one comparison; storing "lives 5 minutes" would need arithmetic on every read and would make the answer depend on when the check ran.
+
+**Lazy expiry, no sweeper thread**: expired entries are dropped when read, and a full cache calls `purgeExpired` *before* evicting a live key. No background thread means nothing extra to lock or shut down; the cost is that an untouched expired entry holds memory until something bumps into it. Guava and Caffeine make the same trade. `purgeExpired()` is exposed for callers who want to reclaim on a schedule.
+
+**Two ordering details worth saying out loud**:
+1. In `get`, expiry is checked **before** `policy.keyAccessed` -- a stale read must never count as a hit, or a dead key gets promoted to MRU and outlives live ones.
+2. In `put`, a full cache purges the dead **before** choosing a victim -- otherwise an entry that died an hour ago can push out a key written a second ago.
+
+**Expire-after-write vs expire-after-access**: this implementation refreshes the deadline on write only. Refreshing it in `get` too gives expire-after-access (Guava exposes both as separate knobs) -- but then a key that is polled forever never expires, which is usually not what you want for cache invalidation.
+
+**Injected `Clock`**: TTL code that calls `Instant.now()` can only be tested with `Thread.sleep`. A `Clock` parameter makes expiry deterministic and instant to test -- `LruCacheDemo`'s `SteppableClock` is 20 lines and the TTL demo prints the same output every run.
+
+---
+
+## Correctness Traps (the bugs that actually fail candidates)
+
+Both of these are in `Cache.put`, both compile, and both produce *plausible-looking* output until someone tests the exact case. `LruCacheDemo.runUpdateOnFullCache()` exists purely to guard them.
+
+### Trap 1: `put` on an **existing** key must take the update path
+
+A write to a key already in the cache is an **update**, not an insert. Falling through to the insert path breaks two things at once:
+
+- **The capacity check fires** even though an update doesn't grow the cache -> an innocent key is evicted. On a full cache, `put(2, "new")` kills key 1 for no reason.
+- **`policy.keyAdded` runs on an update** -> LRU builds a *second* `Node` for key 2 and overwrites `nodeMap[2]`. The old node is still linked into the DLL but is now unreachable from the map. The list has 4 nodes, the map has 3, and `tail.prev` is a stale orphan -- so the next eviction picks the **most** recently used key. Eviction order goes visibly wrong the moment an interviewer types one update into your `main`.
+
+The fix is the early return:
+
+```java
+if (data.containsKey(key)) {
+    data.put(key, entry);
+    policy.keyAccessed(key);   // an access, NOT an add
+    return;                    // no capacity check, no eviction
+}
+```
+
+Note this is also why FIFO's `keyAccessed` being a no-op is correct: a rewrite is not a new arrival, so it must not move the key in the queue.
+
+### Trap 2: don't call `keyRemoved` twice
+
+```java
+remove(victim);                 // the PUBLIC method — already calls policy.keyRemoved
+policy.keyRemoved(victim);      // second call
+```
+
+LRU survives it silently (`nodeMap.remove` returns `null`, so the second call is a no-op), which is exactly why it lives so long in a codebase. LFU does not: any counter-based policy decrements twice and corrupts `minFreq`, so the *next* eviction picks the wrong victim. Latent, invisible under LRU, and precisely the thing a reviewer traces.
+
+This implementation removes the possibility structurally: every deletion funnels through one private helper, so the "data and policy always agree" invariant has exactly one implementation to get right.
+
+```java
+private void drop(K key) {
+    data.remove(key);           // the MAP's remove, not this.remove(...)
+    policy.keyRemoved(key);
+}
+```
 
 ---
 
@@ -387,29 +592,55 @@ Because **the cache owns the value storage**, not the policy. The flow has to be
 
 If `selectEvictionCandidate` also removed the key from the policy's bookkeeping, the policy and the cache would drift out of sync between steps 1 and 2 -- if step 2 throws or is interrupted, the policy now believes a key is gone that's actually still in `data`. Two methods keeps the invariant repairable: the cache stays the source of truth, the policy is always told what happened.
 
-### Q14. What changes if the cache needs TTL (time-to-live) support?
+### Q14. How does TTL work here, and why isn't it an `EvictionPolicy`?
 
-Two clean options, both keep the `EvictionPolicy` strategy intact:
-- **Wrap the value**: `Cache<K, TimedValue<V>>` where `TimedValue` holds `value` + `insertedAt`. `get` checks the timestamp and treats expired entries as misses, calling `remove` lazily.
-- **Add a separate expiry policy layer**: a background sweeper, or a `DelayQueue<K>` that fires on expiry and calls `cache.remove(key)`.
+Values are stored as an immutable `CacheEntry<V>` holding the value plus an absolute `expiresAt` instant (`null` = never). `Cache` takes an optional cache-wide `defaultTtl`; `put(k, v, ttl)` overrides it per entry. Expiry is lazy: `get` drops an expired entry and reports a miss, and a full `put` purges dead entries before evicting a live one. `purgeExpired()` is exposed for eager reclamation.
 
-Don't fold TTL into `EvictionPolicy` -- TTL is *time-based eviction*, which is a different concern from *access-based eviction*. Mixing them violates SRP.
+It is deliberately **not** an `EvictionPolicy`, because the two answer different questions: eviction answers *"we're full -- who leaves?"*, TTL answers *"is this entry still true?"* A cache with free space must still refuse a stale value, so expiry cannot live in something that's only consulted under capacity pressure. Putting it on the entry means LRU, LFU, FIFO and any future policy get TTL for free; folding it into the four-method interface would force every implementation to reimplement the same clock check -- a straight SRP violation.
+
+### Q15. `FIFOEvictionPolicy.keyAccessed` is an empty method. Is that a bug?
+
+No -- it is the entire definition of the policy. FIFO orders by *when a key arrived*, so a read must not change a key's position. A key hit a million times is still evicted the instant it becomes the oldest arrival. The method carries a comment saying the emptiness is intentional, because an empty body is exactly the kind of thing a well-meaning reviewer "fixes" -- and a remove-then-add in there would silently convert FIFO into LRU.
+
+### Q16. Why would anyone pick FIFO over LRU?
+
+Because FIFO's read path does *zero* bookkeeping -- no relinking, no counter, no allocation -- so it's the cheapest policy to run and the easiest to reason about under a lock. It fits workloads where entries are naturally uniform (fixed-size buffers, write-behind queues, replay windows). Its weakness is the flip side: no recency or frequency awareness whatsoever, so a hot key ages out on schedule like any other. Worth adding: `new LinkedHashMap<>(16, 0.75f, true)` is LRU and `false` is FIFO -- the two are one boolean apart.
+
+### Q17. Why store an absolute `expiresAt` instead of the TTL duration plus an insertion time?
+
+Because the check then costs one comparison against the clock, with no arithmetic on the read path, and the answer doesn't depend on *when* the check happens to run. Storing a duration means recomputing `insertedAt + ttl` on every single read for no benefit. The `null` case is also cleaner: `expiresAt == null` reads directly as "never expires".
+
+### Q18. Why lazy expiry instead of a background sweeper thread?
+
+A sweeper is a second thread that has to take the same lock, be sized, be shut down, and be reasoned about -- real complexity for a feature that lazy checks already deliver correctly. Lazily, an entry can never be *served* after its deadline, which is the actual correctness requirement; the only cost is that an expired entry nobody touches again occupies memory until something bumps into it. Guava and Caffeine make exactly this trade. `purgeExpired()` is exposed so a caller who cares can schedule reclamation, and the push-model alternative -- a `DelayQueue<K>` fed on each `put` and drained by one thread calling `cache.remove` -- is the answer if the interviewer wants eager expiry.
+
+### Q19. Why does `size()` count entries that have already expired?
+
+Because making it exact means an O(n) scan on a call every caller expects to be O(1). The method documents the behaviour and `purgeExpired()` gives you the exact live count on demand. This is the honest trade: an approximate O(1) `size` plus an explicit O(n) purge beats an O(n) `size` that hides its cost.
+
+### Q20. Why does `Cache` take a `java.time.Clock` instead of calling `Instant.now()`?
+
+Because otherwise every TTL test has to `Thread.sleep`, which makes the suite slow and flaky. `Clock` is the standard Java seam for time: tests inject a fixed or hand-cranked clock and step time forward deterministically -- `LruCacheDemo.SteppableClock` is 20 lines and the TTL demo runs instantly with identical output every time. A second benefit: each operation reads the clock **once** and judges every entry it touches against that one instant, so a bulk purge can't be internally inconsistent.
+
+### Q21. `LinkedHashMap` with `accessOrder=true` is LRU in five lines. Why hand-roll the DLL?
+
+For the interview, because "implement an LRU cache" is asking for the doubly-linked-list-plus-hashmap structure, and `LinkedHashMap` **is** that structure -- reaching for it means the library performs the exact demonstration you're being graded on, and the reasoning (why a DLL not a singly linked list, why sentinels, why key->node) never gets said. For production, you should use it: this repo ships `LinkedHashMapLRUEvictionPolicy` behind the same interface, and it produces identical output to the hand-rolled policy. The sequencing is what matters -- hand-roll it first, then mention the library version. Said first it's a dodge; said second it's range. Note also that the famous one-class variant (`extends LinkedHashMap` + `removeEldestEntry`) hardcodes you to LRU with no seam for LFU or FIFO, and isn't thread-safe.
 
 ### Concurrency questions (asked whenever your code uses `synchronized`)
 
 > Interviewers treat these keywords as an invitation. The moment they spot `synchronized` on `get` / `put` in `Cache` they ask *"why that and not the alternative?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for full explanations; the rapid-fire versions:
 
-### Q15. Why is `synchronized` on `get` **and** `put`, not just `put`?
+### Q22. Why is `synchronized` on `get` **and** `put`, not just `put`?
 
 Because in `Cache`, **a `get` is also a write**. `Cache.get` calls `policy.keyAccessed(key)`, which splices a `Node` to the head of `LRUEvictionPolicy`'s doubly linked list (or bumps a `freqBuckets` entry in `LFUEvictionPolicy`). That mutation races exactly like `put` does, so `get` needs the same lock. This is why a plain "read lock" or a `ConcurrentHashMap` on `data` is insufficient -- there is no truly read-only operation here, so guarding only the writes leaves the recency bookkeeping unprotected.
 
-### Q16. Why one lock over **both** `data` and `policy` instead of locking each separately?
+### Q23. Why one lock over **both** `data` and `policy` instead of locking each separately?
 
 Because `Cache` maintains an invariant *across two structures*: the keys in the `data` HashMap must exactly match the keys the `policy` tracks (its DLL / freq buckets). A `put` does "evict victim from `data`, tell `policy.keyRemoved`, insert new key, tell `policy.keyAdded`" -- those steps must move together atomically. Two independently-locked concurrent structures would let a second thread observe `data` and `policy` mid-transaction (one updated, the other not) and pick a victim that no longer exists. The single `synchronized` monitor on `Cache` makes the whole compound operation one critical section, so the two structures can never diverge.
 
-### Q17. The cache is correct but contended -- how would you reduce lock contention?
+### Q24. The cache is correct but contended -- how would you reduce lock contention?
 
-The standard move is **lock striping / sharding**: split into N independent `Cache` shards keyed by `hash(key) % N` (how `ConcurrentHashMap` and Caffeine scale), so unrelated keys never block each other while each shard keeps its own coarse `synchronized` lock over its `data` + `policy`. A `ReentrantReadWriteLock` is the usual second suggestion, but note the catch from Q15: **a `get` here still writes** (it reorders recency), so most reads would have to take the write lock anyway -- an RW-lock helps far less than usual and can even be slower due to its bookkeeping overhead. Sharding is the better answer for this design.
+The standard move is **lock striping / sharding**: split into N independent `Cache` shards keyed by `hash(key) % N` (how `ConcurrentHashMap` and Caffeine scale), so unrelated keys never block each other while each shard keeps its own coarse `synchronized` lock over its `data` + `policy`. A `ReentrantReadWriteLock` is the usual second suggestion, but note the catch from Q22: **a `get` here still writes** (it reorders recency), so most reads would have to take the write lock anyway -- an RW-lock helps far less than usual and can even be slower due to its bookkeeping overhead. Sharding is the better answer for this design.
 
 ---
 

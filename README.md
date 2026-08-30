@@ -16,7 +16,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 8 | Movie Ticket Booking System | [`movie-ticket-booking-system/`](movie-ticket-booking-system/) |
 | 9 | Splitwise | [`splitwise/`](splitwise/) |
 | 10 | Snake and Ladder Game | [`snake-and-ladder/`](snake-and-ladder/) |
-| 11 | LRU Cache (with LFU strategy variant) | [`lru-cache/`](lru-cache/) |
+| 11 | Cache with pluggable eviction (LRU / LFU / FIFO) + TTL | [`lru-cache/`](lru-cache/) |
 | 12 | Rate Limiter (with Token Bucket / Sliding Window strategies) | [`rate-limiter/`](rate-limiter/) |
 | 13 | Notification Service (multi-channel: Email / SMS / Push) | [`notification-service/`](notification-service/) |
 | 14 | Meeting Room Booking (interval overlap + allocation strategy) | [`meeting-room-booking/`](meeting-room-booking/) |

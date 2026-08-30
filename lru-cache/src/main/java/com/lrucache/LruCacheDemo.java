@@ -4,6 +4,7 @@ import com.lrucache.model.Cache;
 import com.lrucache.strategy.FIFOEvictionPolicy;
 import com.lrucache.strategy.LFUEvictionPolicy;
 import com.lrucache.strategy.LinkedHashMapLRUEvictionPolicy;
+import com.lrucache.strategy.TTLEvictionPolicy;
 import com.lrucache.strategy.LRUEvictionPolicy;
 
 import java.time.Clock;
@@ -25,6 +26,8 @@ public class LruCacheDemo {
         runUpdateOnFullCache();
         System.out.println();
         runTTL();
+        System.out.println();
+        runTTLEviction();
     }
 
     private static void runLRU() {
@@ -166,6 +169,55 @@ public class LruCacheDemo {
         clock.advance(Duration.ofSeconds(60));   // everything with a TTL is now stale
         System.out.println("purgeExpired() removed = " + cache.purgeExpired());
         System.out.println("survivors = size " + cache.size() + " (only key 3, the no-TTL entry)");
+    }
+
+    /**
+     * Different classes of key deserve different lifetimes. Declared once and
+     * handed to BOTH the cache and the policy, because they must agree on the
+     * deadlines -- see the README note on this being the seam where a
+     * key-only strategy interface starts to strain.
+     */
+    private static Duration ttlFor(String key) {
+        if (key.startsWith("config:")) {
+            return Duration.ofSeconds(5);       // dies soonest
+        }
+        if (key.startsWith("session:")) {
+            return Duration.ofSeconds(30);
+        }
+        return Duration.ofSeconds(300);         // static assets, effectively long-lived
+    }
+
+    /**
+     * TTL-ORDERED EVICTION, which is a different question from TTL expiry.
+     * Expiry ("is this still true?") is enforced by Cache on every read.
+     * This policy only answers "we are FULL -- who goes?" and it picks
+     * whichever entry was going to die soonest anyway.
+     */
+    private static void runTTLEviction() {
+        System.out.println("=== TTL-ordered eviction (capacity 3) ===");
+
+        SteppableClock clock = new SteppableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        Cache<String, String> cache = new Cache<>(
+                3, new TTLEvictionPolicy<>(LruCacheDemo::ttlFor, clock), null, clock);
+
+        // Same TTLs go to the cache entries and to the policy.
+        cache.put("session:a", "A", ttlFor("session:a"));   // dies at t+30s
+        cache.put("config:b", "B", ttlFor("config:b"));     // dies at t+5s  <-- nearest
+        cache.put("static:c", "C", ttlFor("static:c"));     // dies at t+300s
+
+        // Read config:b hard. Under LRU that would save it; here it changes
+        // nothing, because eviction is ordered by deadline, not by use.
+        cache.get("config:b");
+        cache.get("config:b");
+
+        clock.advance(Duration.ofSeconds(1));               // nothing has expired yet
+        cache.put("session:d", "D", ttlFor("session:d"));   // cache is full -> evict
+
+        System.out.println("config:b [5s, most read] evicted?  " + !cache.get("config:b").isPresent());
+        System.out.println("session:a [30s] = " + cache.get("session:a").orElse("EVICTED"));
+        System.out.println("static:c [300s] = " + cache.get("static:c").orElse("EVICTED"));
+        System.out.println("session:d [30s] = " + cache.get("session:d").orElse("EVICTED"));
+        System.out.println("(LRU would have evicted session:a; FIFO would have evicted session:a too)");
     }
 
     /**

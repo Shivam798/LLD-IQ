@@ -1,6 +1,6 @@
 # LRU Cache — Low Level Design
 
-A fixed-capacity, generic, thread-safe in-memory cache with **pluggable eviction policies** (LRU, LFU and FIFO out of the box — plus a five-line `LinkedHashMap` LRU for contrast) and **optional per-entry TTL**.
+A fixed-capacity, generic, thread-safe in-memory cache with **pluggable eviction policies** (LRU, LFU, FIFO and deadline-ordered TTL out of the box — plus a five-line `LinkedHashMap` LRU for contrast) and **optional per-entry TTL**.
 
 ---
 
@@ -11,7 +11,7 @@ Design an in-memory cache that:
 - Supports `get(key)`, `put(key, value)`, `remove(key)` in **O(1)**
 - When full, evicts one entry to make room for a new key
 - Allows the eviction policy to be swapped without touching the cache itself
-- Ships with three ready policies -- **Least Recently Used (LRU)**, **Least Frequently Used (LFU)**, **First In First Out (FIFO)** -- plus a `LinkedHashMap`-backed LRU that shows the library shortcut
+- Ships with four ready policies -- **Least Recently Used (LRU)**, **Least Frequently Used (LFU)**, **First In First Out (FIFO)**, **nearest-deadline (TTL-ordered)** -- plus a `LinkedHashMap`-backed LRU that shows the library shortcut
 - Supports **time-to-live**: a cache-wide default TTL, overridable per entry, with entries expiring whether or not the cache is full
 - Is safe to call from multiple threads
 
@@ -19,7 +19,7 @@ Design an in-memory cache that:
 
 | | Question it answers | Who decides | Where it lives |
 |---|---|---|---|
-| **Eviction** | "We are FULL — who leaves?" | `EvictionPolicy` (LRU / LFU / FIFO) | `strategy/` |
+| **Eviction** | "We are FULL — who leaves?" | `EvictionPolicy` (LRU / LFU / FIFO / TTL-ordered) | `strategy/` |
 | **Expiry (TTL)** | "Is this entry still TRUE?" | the clock | `CacheEntry` + `Cache` |
 
 A cache with free space must still refuse to serve a stale entry, so TTL cannot live inside a policy that only speaks up when the cache is full.
@@ -160,6 +160,17 @@ classDiagram
         +selectEvictionCandidate() K
     }
 
+    class TTLEvictionPolicy~K~ {
+        -clock: Clock
+        -ttlResolver: Function~K, Duration~
+        -byDeadline: TreeMap~Instant, LinkedHashSet~K~~
+        -deadlines: HashMap~K, Instant~
+        +keyAdded(K) «O(log n)»
+        +keyAccessed(K) «no-op by design»
+        +keyRemoved(K) «O(log n)»
+        +selectEvictionCandidate() K «O(log n)»
+    }
+
     class FIFOEvictionPolicy~K~ {
         -insertionOrder: LinkedHashSet~K~
         +keyAdded(K)
@@ -171,6 +182,7 @@ classDiagram
     LRUEvictionPolicy ..|> EvictionPolicy
     LFUEvictionPolicy ..|> EvictionPolicy
     FIFOEvictionPolicy ..|> EvictionPolicy
+    TTLEvictionPolicy ..|> EvictionPolicy
     LinkedHashMapLRUEvictionPolicy ..|> EvictionPolicy
     Cache --> EvictionPolicy : policy
     Cache *-- CacheEntry : data values
@@ -339,6 +351,32 @@ Two further weaknesses if the interviewer pushes:
 
 **Interview power move**: *"That's the hand-rolled version, so you can see the mechanism. In production I'd write `new LinkedHashMap<>(16, 0.75f, true)` and override `removeEldestEntry` -- accessOrder=true is exactly this doubly linked list, already implemented and battle-tested in the JDK. I've kept both in this repo behind the same interface; they produce identical output. I led with the hand-rolled one because the DLL is the part you were asking about."*
 
+### Layer 10: TTL-ordered eviction -- a second, narrower use of the clock
+
+**What**: `TTLEvictionPolicy` evicts the key with the **nearest deadline** -- the entry about to die anyway, so losing it costs least. It is a real `EvictionPolicy`, and it is *not* the same thing as Layer 7's expiry.
+
+| | Question | When it runs | Where |
+|---|---|---|---|
+| `Cache` + `CacheEntry` (Layer 7) | "is this entry still **true**?" | every read, full or not | correctness |
+| `TTLEvictionPolicy` (this layer) | "we are **full** -- who goes?" | only under capacity pressure | performance |
+
+They compose: a full `put` first purges what is already dead, then sacrifices whatever was going to die next.
+
+**Why it needs a `TreeMap` when LFU gets away with `HashMap` + `minFreq`**: this is the sharpest comparison in the module. LFU's `minFreq++` trick works because its buckets are **dense integers that advance by exactly one** -- a promoted key always lands in `bucket[f+1]`, so the new minimum is knowable without looking. Deadlines are arbitrary `Instant`s: once the earliest empties, the next could be a millisecond or a week later, and nothing lands anywhere predictable. There is no "+1" to take, so the minimum has to come from a structure that sorts itself.
+
+```
+LFU  : HashMap + tracked minFreq  ->  O(1) hooks, but needs recomputeMinFreq() repair
+TTL  : TreeMap by deadline        ->  O(log n) hooks, but never needs repair at all
+```
+
+**Be honest about the complexity**: this policy is O(log n), not O(1), and that is not fixable. "Give me the smallest of an arbitrary set of deadlines" is a priority-queue problem, and priority queues cost log n. Claiming O(1) here is the kind of thing that gets caught.
+
+**The degenerate case worth naming**: if every key has the *same* TTL, deadlines rise monotonically with arrival, so nearest-deadline == oldest-arrival and this policy **is** FIFO -- at O(log n) instead of O(1). It only earns its log n when `session:*` lives 30 minutes and `config:*` lives 30 seconds. Reach for `FIFOEvictionPolicy` otherwise.
+
+**Where the strategy interface starts to strain** (say this before the interviewer says it): the four hooks carry only a **key**, but this policy needs each key's **deadline**. The demo resolves it by handing the same `ttlFor(key)` function to both the cache and the policy -- one source of truth, passed twice. The alternative is widening `keyAdded(K)` to `keyAdded(K, EntryMetadata)`, which would force LRU, LFU and FIFO to accept a parameter none of them want. I chose duplication over widening because the cost lands on one policy instead of all four; if deadline-ordered eviction became the primary use case, widening would be the right call. Note the failure mode if the two disagree is a *worse victim choice*, never a stale read -- `Cache` remains the only authority on expiry.
+
+**Interview power move**: *"There are two different TTL questions and they belong in different places. 'Is this entry still true?' is correctness -- that lives on the entry and every policy inherits it. 'Who leaves when we're full?' is a policy, and answering it with 'whoever expires soonest' needs a TreeMap, not the HashMap-plus-minimum trick LFU uses -- because deadlines aren't dense integers, so there's no +1 to take. That costs me O(log n), and I'd say so rather than pretend it's O(1)."*
+
 ### The Full Picture
 
 ```
@@ -356,6 +394,8 @@ EvictionPolicy<K>                 (interface -- 4 hook methods; "who leaves when
     +-- LFUEvictionPolicy<K>      (HashMap + freq buckets + minFreq)
     |
     +-- FIFOEvictionPolicy<K>     (LinkedHashSet in arrival order; keyAccessed = no-op)
+    |
+    +-- TTLEvictionPolicy<K>      (TreeMap by deadline; evict whatever dies soonest, O(log n))
     |
     +-- <future policy>           (MRU, ARC, 2Q -- plug in without touching Cache)
 ```
@@ -383,6 +423,7 @@ lru-cache/
         ├── LRUEvictionPolicy.java       # DLL + nodeMap (Node is a private static nested class)
         ├── LFUEvictionPolicy.java       # freqMap + freq->LinkedHashSet buckets + tracked minFreq
         ├── FIFOEvictionPolicy.java      # LinkedHashSet in arrival order; keyAccessed is a no-op
+        ├── TTLEvictionPolicy.java       # TreeMap by deadline — evicts whatever dies soonest, O(log n)
         └── LinkedHashMapLRUEvictionPolicy.java  # Same LRU in 5 lines — ship it, don't lead with it
 ```
 
@@ -477,6 +518,8 @@ FIFO is the policy interviewers use to check whether your abstraction is real or
 2. In `put`, a full cache purges the dead **before** choosing a victim -- otherwise an entry that died an hour ago can push out a key written a second ago.
 
 **Expire-after-write vs expire-after-access**: this implementation refreshes the deadline on write only. Refreshing it in `get` too gives expire-after-access (Guava exposes both as separate knobs) -- but then a key that is polled forever never expires, which is usually not what you want for cache invalidation.
+
+**Two different TTL questions, two different places**: `Cache` + `CacheEntry` enforce *expiry* (never serve a stale value, full or not). `TTLEvictionPolicy` decides *eviction order* (when full, drop whatever dies soonest). The first is correctness and applies always; the second is performance and only runs under capacity pressure. They compose -- pair them and a full `put` purges the dead, then sacrifices the nearly-dead. Only the first is mandatory.
 
 **Injected `Clock`**: TTL code that calls `Instant.now()` can only be tested with `Thread.sleep`. A `Clock` parameter makes expiry deterministic and instant to test -- `LruCacheDemo`'s `SteppableClock` is 20 lines and the TTL demo prints the same output every run.
 
@@ -641,6 +684,10 @@ Because `Cache` maintains an invariant *across two structures*: the keys in the 
 ### Q24. The cache is correct but contended -- how would you reduce lock contention?
 
 The standard move is **lock striping / sharding**: split into N independent `Cache` shards keyed by `hash(key) % N` (how `ConcurrentHashMap` and Caffeine scale), so unrelated keys never block each other while each shard keeps its own coarse `synchronized` lock over its `data` + `policy`. A `ReentrantReadWriteLock` is the usual second suggestion, but note the catch from Q22: **a `get` here still writes** (it reorders recency), so most reads would have to take the write lock anyway -- an RW-lock helps far less than usual and can even be slower due to its bookkeeping overhead. Sharding is the better answer for this design.
+
+### Q25. You said TTL shouldn't be an `EvictionPolicy` -- but `TTLEvictionPolicy` exists. Which is it?
+
+Both, because they answer different questions. *Expiry* ("is this entry still true?") is a correctness rule that must hold whether or not the cache is full, so it lives on `CacheEntry` and every policy inherits it -- that part genuinely does not belong in the strategy. *Eviction order* ("we're full, who goes?") is exactly what the strategy is for, and "whoever expires soonest" is a perfectly good answer to it, because an entry about to die is nearly worthless already. `TTLEvictionPolicy` implements only the second. Note it needs a `TreeMap` rather than LFU's HashMap-plus-tracked-minimum, because deadlines are arbitrary instants with no "+1" step -- so it's O(log n), and with a uniform TTL it degenerates into FIFO.
 
 ---
 

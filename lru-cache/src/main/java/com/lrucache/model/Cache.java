@@ -1,5 +1,6 @@
 package com.lrucache.model;
 
+import com.lrucache.enums.ExpiryMode;
 import com.lrucache.strategy.EvictionPolicy;
 
 import java.time.Clock;
@@ -31,7 +32,9 @@ import java.util.Optional;
  *
  * TTL is enforced lazily on read (an expired entry is a miss, and is dropped
  * on the spot) and opportunistically on write (a full cache purges dead
- * entries before it evicts a live one). There is no background sweeper
+ * entries before it evicts a live one). ExpiryMode chooses WHEN the deadline
+ * is stamped: AFTER_WRITE (default) fixes it at insert, AFTER_ACCESS pushes
+ * it forward on every read so only idle entries die. There is no background sweeper
  * thread: lazy expiry keeps the design allocation-free and thread-free, at
  * the cost of expired-but-untouched entries occupying memory until something
  * bumps into them -- which is exactly what Guava and Caffeine do. Callers
@@ -58,11 +61,17 @@ public class Cache<K, V> {
     // Without this seam, every TTL test is slow and flaky.
     private final Clock clock;
 
+    // Whether a read pushes an entry's deadline forward. AFTER_WRITE is the
+    // default because it is the safe one: it guarantees an entry cannot
+    // outlive its TTL no matter how hot it is. AFTER_ACCESS is opt-in
+    // precisely because it silently defeats that guarantee.
+    private final ExpiryMode expiryMode;
+
     /**
      * Capacity-bounded cache with no expiry. Entries live until evicted.
      */
     public Cache(int capacity, EvictionPolicy<K> policy) {
-        this(capacity, policy, null, Clock.systemUTC());
+        this(capacity, policy, null, Clock.systemUTC(), ExpiryMode.AFTER_WRITE);
     }
 
     /**
@@ -70,10 +79,15 @@ public class Cache<K, V> {
      * was written. Individual puts can still override it.
      */
     public Cache(int capacity, EvictionPolicy<K> policy, Duration defaultTtl) {
-        this(capacity, policy, defaultTtl, Clock.systemUTC());
+        this(capacity, policy, defaultTtl, Clock.systemUTC(), ExpiryMode.AFTER_WRITE);
     }
 
     public Cache(int capacity, EvictionPolicy<K> policy, Duration defaultTtl, Clock clock) {
+        this(capacity, policy, defaultTtl, clock, ExpiryMode.AFTER_WRITE);
+    }
+
+    public Cache(int capacity, EvictionPolicy<K> policy, Duration defaultTtl, Clock clock,
+                 ExpiryMode expiryMode) {
         if (capacity <= 0) {
             throw new IllegalArgumentException("Capacity must be positive");
         }
@@ -83,7 +97,11 @@ public class Cache<K, V> {
         if (clock == null) {
             throw new IllegalArgumentException("Clock is required");
         }
+        if (expiryMode == null) {
+            throw new IllegalArgumentException("ExpiryMode is required");
+        }
         validateTtl(defaultTtl);
+        this.expiryMode = expiryMode;
         this.capacity = capacity;
         this.policy = policy;
         this.defaultTtl = defaultTtl;
@@ -99,17 +117,29 @@ public class Cache<K, V> {
      * re-written would leak. Note the ordering: expiry is checked BEFORE
      * policy.keyAccessed, so reading a stale entry never counts as a hit and
      * can never promote a dead key to most-recently-used.
+     *
+     * Under AFTER_ACCESS the surviving entry has its deadline restarted, which
+     * is why this "read" writes back into `data`. The renewal happens AFTER
+     * the expiry check, so a read can revive an entry that was still alive but
+     * can never resurrect one that had already died.
      */
     public synchronized Optional<V> get(K key) {
         CacheEntry<V> entry = data.get(key);
         if (entry == null) {
             return Optional.empty();
         }
-        if (entry.isExpired(clock.instant())) {
+        Instant now = clock.instant();
+        if (entry.isExpired(now)) {
             drop(key);
             return Optional.empty();
         }
         policy.keyAccessed(key);
+        if (expiryMode == ExpiryMode.AFTER_ACCESS) {
+            CacheEntry<V> renewed = entry.renewed(now);
+            if (renewed != entry) {
+                data.put(key, renewed);
+            }
+        }
         return Optional.of(entry.value());
     }
 
@@ -134,7 +164,7 @@ public class Cache<K, V> {
         validateTtl(ttl);
 
         Instant now = clock.instant();
-        CacheEntry<V> entry = new CacheEntry<>(value, ttl == null ? null : now.plus(ttl));
+        CacheEntry<V> entry = new CacheEntry<>(value, ttl, now);
 
         if (data.containsKey(key)) {
             // Overwrite refreshes the TTL: the entry's deadline is measured

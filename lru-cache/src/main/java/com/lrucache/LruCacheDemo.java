@@ -1,5 +1,6 @@
 package com.lrucache;
 
+import com.lrucache.enums.ExpiryMode;
 import com.lrucache.model.Cache;
 import com.lrucache.strategy.FIFOEvictionPolicy;
 import com.lrucache.strategy.LFUEvictionPolicy;
@@ -28,6 +29,8 @@ public class LruCacheDemo {
         runTTL();
         System.out.println();
         runTTLEviction();
+        System.out.println();
+        runExpireAfterAccess();
     }
 
     private static void runLRU() {
@@ -218,6 +221,62 @@ public class LruCacheDemo {
         System.out.println("static:c [300s] = " + cache.get("static:c").orElse("EVICTED"));
         System.out.println("session:d [30s] = " + cache.get("session:d").orElse("EVICTED"));
         System.out.println("(LRU would have evicted session:a; FIFO would have evicted session:a too)");
+    }
+
+    /**
+     * ExpiryMode is the single knob separating the two TTL semantics, and with
+     * a uniform TTL each one collapses into a policy we already have:
+     *
+     *   AFTER_WRITE  + uniform ttl -> nearest deadline == oldest arrival  -> FIFO
+     *   AFTER_ACCESS + uniform ttl -> nearest deadline == least recently used -> LRU
+     *
+     * Same class, one enum apart -- exactly the axis LinkedHashMap's
+     * accessOrder flag sits on.
+     */
+    private static void runExpireAfterAccess() {
+        System.out.println("=== ExpiryMode: AFTER_WRITE vs AFTER_ACCESS (capacity 3, ttl 10s) ===");
+
+        Duration ttl = Duration.ofSeconds(10);
+
+        // --- AFTER_WRITE: reads buy no extra life, so key 1 dies on schedule.
+        SteppableClock writeClock = new SteppableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        Cache<Integer, String> afterWrite = new Cache<>(
+                3, new LRUEvictionPolicy<>(), ttl, writeClock, ExpiryMode.AFTER_WRITE);
+        afterWrite.put(1, "one");
+        for (int t = 0; t < 3; t++) {
+            writeClock.advance(Duration.ofSeconds(4));
+            afterWrite.get(1);                       // read every 4s, never idle
+        }
+        System.out.println("AFTER_WRITE  -> read every 4s, at t+12s: " + afterWrite.get(1).orElse("EXPIRED"));
+
+        // --- AFTER_ACCESS: the same reads keep pushing the deadline out.
+        SteppableClock accessClock = new SteppableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        Cache<Integer, String> afterAccess = new Cache<>(
+                3, new LRUEvictionPolicy<>(), ttl, accessClock, ExpiryMode.AFTER_ACCESS);
+        afterAccess.put(1, "one");
+        for (int t = 0; t < 3; t++) {
+            accessClock.advance(Duration.ofSeconds(4));
+            afterAccess.get(1);
+        }
+        System.out.println("AFTER_ACCESS -> read every 4s, at t+12s: " + afterAccess.get(1).orElse("EXPIRED"));
+        accessClock.advance(Duration.ofSeconds(11));  // now leave it idle past the ttl
+        System.out.println("AFTER_ACCESS -> then idle 11s:           " + afterAccess.get(1).orElse("EXPIRED"));
+
+        // --- The degeneracy: AFTER_ACCESS + uniform ttl on the TTL policy IS LRU.
+        SteppableClock c = new SteppableClock(Instant.parse("2026-01-01T00:00:00Z"));
+        Cache<Integer, String> asLru = new Cache<>(
+                3, new TTLEvictionPolicy<>(k -> ttl, c, ExpiryMode.AFTER_ACCESS), null, c);
+        asLru.put(1, "one");  c.advance(Duration.ofSeconds(1));
+        asLru.put(2, "two");  c.advance(Duration.ofSeconds(1));
+        asLru.put(3, "three"); c.advance(Duration.ofSeconds(1));
+        asLru.get(1);                                  // key 1 becomes most recently used
+        c.advance(Duration.ofSeconds(1));
+        asLru.put(4, "four");                          // full -> evict least recently used
+        System.out.println("TTL policy (AFTER_ACCESS, uniform ttl) evicted key 2, like LRU? "
+                + !asLru.get(2).isPresent());
+        System.out.println("  get(1) = " + asLru.get(1).orElse("EVICTED")
+                + ", get(3) = " + asLru.get(3).orElse("EVICTED")
+                + ", get(4) = " + asLru.get(4).orElse("EVICTED"));
     }
 
     /**

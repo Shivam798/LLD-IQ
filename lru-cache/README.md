@@ -91,9 +91,11 @@ classDiagram
         -policy: EvictionPolicy~K~
         -defaultTtl: Duration «nullable»
         -clock: Clock «injected»
+        -expiryMode: ExpiryMode «default AFTER_WRITE»
         +Cache(int, EvictionPolicy~K~)
         +Cache(int, EvictionPolicy~K~, Duration)
         +Cache(int, EvictionPolicy~K~, Duration, Clock)
+        +Cache(int, EvictionPolicy~K~, Duration, Clock, ExpiryMode)
         +get(K) Optional~V~ «sync»
         +put(K, V) «sync»
         +put(K, V, Duration) «sync»
@@ -108,10 +110,19 @@ classDiagram
     class CacheEntry~V~ {
         <<immutable>>
         -value: V
+        -ttl: Duration «null = never»
         -expiresAt: Instant «null = never»
         +value() V
+        +ttl() Duration
         +expiresAt() Instant
+        +renewed(Instant) CacheEntry~V~
         +isExpired(Instant) boolean
+    }
+
+    class ExpiryMode {
+        <<enumeration>>
+        AFTER_WRITE
+        AFTER_ACCESS
     }
 
     class EvictionPolicy~K~ {
@@ -162,12 +173,15 @@ classDiagram
 
     class TTLEvictionPolicy~K~ {
         -clock: Clock
+        -expiryMode: ExpiryMode
         -ttlResolver: Function~K, Duration~
         -byDeadline: TreeMap~Instant, LinkedHashSet~K~~
         -deadlines: HashMap~K, Instant~
         +keyAdded(K) «O(log n)»
-        +keyAccessed(K) «no-op by design»
+        +keyAccessed(K) «no-op if AFTER_WRITE, restamp if AFTER_ACCESS»
         +keyRemoved(K) «O(log n)»
+        -stamp(K)
+        -unstamp(K) Instant
         +selectEvictionCandidate() K «O(log n)»
     }
 
@@ -186,6 +200,8 @@ classDiagram
     LinkedHashMapLRUEvictionPolicy ..|> EvictionPolicy
     Cache --> EvictionPolicy : policy
     Cache *-- CacheEntry : data values
+    Cache --> ExpiryMode : expiryMode
+    TTLEvictionPolicy --> ExpiryMode : expiryMode
     LRUEvictionPolicy *-- Node : nodeMap values
 ```
 </details>
@@ -375,6 +391,19 @@ TTL  : TreeMap by deadline        ->  O(log n) hooks, but never needs repair at 
 
 **Where the strategy interface starts to strain** (say this before the interviewer says it): the four hooks carry only a **key**, but this policy needs each key's **deadline**. The demo resolves it by handing the same `ttlFor(key)` function to both the cache and the policy -- one source of truth, passed twice. The alternative is widening `keyAdded(K)` to `keyAdded(K, EntryMetadata)`, which would force LRU, LFU and FIFO to accept a parameter none of them want. I chose duplication over widening because the cost lands on one policy instead of all four; if deadline-ordered eviction became the primary use case, widening would be the right call. Note the failure mode if the two disagree is a *worse victim choice*, never a stale read -- `Cache` remains the only authority on expiry.
 
+**The knob that makes it two policies: `ExpiryMode`**. `keyAccessed` being empty is only correct for *expire-after-write*. The other half of what Guava offers is *expire-after-access*, where every read pushes the deadline out, and that is a genuinely different policy rather than a variant spelling -- so it is an enum, not a hidden assumption:
+
+| `ExpiryMode` | What a read does | Use it for | Under a **uniform** TTL it is... |
+|---|---|---|---|
+| `AFTER_WRITE` (default) | nothing -- `keyAccessed` is a no-op | **invalidation** ("stale after 5 min, full stop") | **FIFO** |
+| `AFTER_ACCESS` | restamps the deadline | **idle reclamation** ("drop sessions unused for 30 min") | **LRU** |
+
+That last column is the payoff. Under `AFTER_ACCESS`, the nearest deadline is the key read longest ago -- which is the definition of least-recently-used. So one class, one enum apart, reproduces both FIFO and LRU. It is precisely the axis `LinkedHashMap`'s `accessOrder` flag sits on (`false` = FIFO, `true` = LRU), arrived at from the other direction. Both degenerate cases run at O(log n) here, so use the dedicated O(1) policies for them; this class earns its cost only when lifetimes genuinely differ per key.
+
+**Why `AFTER_WRITE` is the default**: `AFTER_ACCESS` means a key that is polled forever *never* expires. If you reached for TTL to guarantee freshness, that silently defeats it -- and the hottest key is exactly the one most likely to be serving stale data. Freshness should be opt-out, not opt-in.
+
+**Where the mode also touches `Cache`**: the same enum drives entry-level expiry, so `get` restamps the surviving `CacheEntry` under `AFTER_ACCESS`. That is why a "read" writes back into `data` -- and why the renewal is sequenced *after* the expiry check: a read can extend an entry that was still alive, but must never resurrect one that had already died. `CacheEntry` keeps its `ttl` alongside `expiresAt` for exactly this, since by read time the cache default and a per-entry override are indistinguishable.
+
 **Interview power move**: *"There are two different TTL questions and they belong in different places. 'Is this entry still true?' is correctness -- that lives on the entry and every policy inherits it. 'Who leaves when we're full?' is a policy, and answering it with 'whoever expires soonest' needs a TreeMap, not the HashMap-plus-minimum trick LFU uses -- because deadlines aren't dense integers, so there's no +1 to take. That costs me O(log n), and I'd say so rather than pretend it's O(1)."*
 
 ### The Full Picture
@@ -414,9 +443,12 @@ lru-cache/
 └── src/main/java/com/lrucache/
     ├── LruCacheDemo.java                # Entry point (main) — LRU / LFU / FIFO / update / TTL demos
     │
+    ├── enums/
+    │   └── ExpiryMode.java              # AFTER_WRITE | AFTER_ACCESS — when the deadline is stamped
+    │
     ├── model/
     │   ├── Cache.java                   # Generic orchestrator — owns HashMap + TTL, delegates eviction
-    │   └── CacheEntry.java              # Immutable value + absolute expiresAt (null = never)
+    │   └── CacheEntry.java              # Immutable value + ttl + absolute expiresAt; renewed(now)
     │
     └── strategy/
         ├── EvictionPolicy.java          # Strategy interface (4 hook methods)
@@ -424,6 +456,7 @@ lru-cache/
         ├── LFUEvictionPolicy.java       # freqMap + freq->LinkedHashSet buckets + tracked minFreq
         ├── FIFOEvictionPolicy.java      # LinkedHashSet in arrival order; keyAccessed is a no-op
         ├── TTLEvictionPolicy.java       # TreeMap by deadline — evicts whatever dies soonest, O(log n)
+        │                                # AFTER_WRITE ⇒ FIFO, AFTER_ACCESS ⇒ LRU when the ttl is uniform
         └── LinkedHashMapLRUEvictionPolicy.java  # Same LRU in 5 lines — ship it, don't lead with it
 ```
 
@@ -470,7 +503,7 @@ lru-cache/
 - **New eviction policy** (FIFO, MRU, random, ARC, 2Q, ...) -> implement `EvictionPolicy<K>`. Zero changes to `Cache`.
 - **Time-based expiry (TTL)** -> **built in.** Pass a `defaultTtl` to the constructor, or a per-entry TTL to `put(k, v, ttl)`. Works with every policy because expiry lives on `CacheEntry`, not in `EvictionPolicy`.
 - **Eager expiry** -> call `purgeExpired()` from a scheduler; or, for a push model, add a `DelayQueue<K>` fed on each `put` and drained by one sweeper thread that calls `cache.remove(key)`.
-- **Expire-after-access instead of expire-after-write** -> refresh `expiresAt` inside `get` as well as `put` (Guava exposes both as separate knobs).
+- **Expire-after-access instead of expire-after-write** -> **built in.** Pass `ExpiryMode.AFTER_ACCESS` to `Cache` (and to `TTLEvictionPolicy` if you're using it), and reads restamp the deadline instead of leaving it fixed.
 - **Cache statistics** (hit rate, miss rate) -> add counters on `Cache` and expose `stats()`.
 - **Listeners on eviction** -> add an `EvictionListener<K, V>` interface and call it from `Cache.put` right before `data.remove(victim)`.
 - **Higher concurrency** -> replace `synchronized` with `ReentrantLock` (allows tryLock + timeout) or shard the cache by key hash so each shard locks independently.
@@ -517,7 +550,9 @@ FIFO is the policy interviewers use to check whether your abstraction is real or
 1. In `get`, expiry is checked **before** `policy.keyAccessed` -- a stale read must never count as a hit, or a dead key gets promoted to MRU and outlives live ones.
 2. In `put`, a full cache purges the dead **before** choosing a victim -- otherwise an entry that died an hour ago can push out a key written a second ago.
 
-**Expire-after-write vs expire-after-access**: this implementation refreshes the deadline on write only. Refreshing it in `get` too gives expire-after-access (Guava exposes both as separate knobs) -- but then a key that is polled forever never expires, which is usually not what you want for cache invalidation.
+**Expire-after-write vs expire-after-access**: both are supported, via the `ExpiryMode` enum passed to `Cache` (and to `TTLEvictionPolicy`). `AFTER_WRITE` -- the default -- fixes the deadline at insert, which is what *invalidation* needs: "this data is stale after 5 minutes, full stop." `AFTER_ACCESS` pushes the deadline out on every read, which is what *idle reclamation* needs: "drop sessions nobody has touched in 30 minutes." The trap that makes `AFTER_WRITE` the default: under `AFTER_ACCESS` a key that is polled forever never expires, and the hottest key is exactly the one most likely to be serving stale data -- so if you reached for TTL to guarantee freshness, `AFTER_ACCESS` silently defeats it.
+
+**The symmetry worth memorising**: with a *uniform* TTL, `TTLEvictionPolicy` collapses into a policy you already have -- `AFTER_WRITE` gives FIFO (nearest deadline == oldest arrival), `AFTER_ACCESS` gives LRU (nearest deadline == least recently read). One class, one enum apart, and it is the same axis as `LinkedHashMap`'s `accessOrder` flag. Both at O(log n), so use the dedicated O(1) policies in those cases.
 
 **Two different TTL questions, two different places**: `Cache` + `CacheEntry` enforce *expiry* (never serve a stale value, full or not). `TTLEvictionPolicy` decides *eviction order* (when full, drop whatever dies soonest). The first is correctness and applies always; the second is performance and only runs under capacity pressure. They compose -- pair them and a full `put` purges the dead, then sacrifices the nearly-dead. Only the first is mandatory.
 
@@ -688,6 +723,14 @@ The standard move is **lock striping / sharding**: split into N independent `Cac
 ### Q25. You said TTL shouldn't be an `EvictionPolicy` -- but `TTLEvictionPolicy` exists. Which is it?
 
 Both, because they answer different questions. *Expiry* ("is this entry still true?") is a correctness rule that must hold whether or not the cache is full, so it lives on `CacheEntry` and every policy inherits it -- that part genuinely does not belong in the strategy. *Eviction order* ("we're full, who goes?") is exactly what the strategy is for, and "whoever expires soonest" is a perfectly good answer to it, because an entry about to die is nearly worthless already. `TTLEvictionPolicy` implements only the second. Note it needs a `TreeMap` rather than LFU's HashMap-plus-tracked-minimum, because deadlines are arbitrary instants with no "+1" step -- so it's O(log n), and with a uniform TTL it degenerates into FIFO.
+
+### Q26. `TTLEvictionPolicy.keyAccessed` is empty like FIFO's -- so why does one get an `ExpiryMode` option and the other doesn't?
+
+Because they are empty for different reasons. FIFO orders by **arrival**, and a read genuinely does not change when a key arrived -- making that method do something wouldn't configure FIFO, it would turn it into a *different policy* (reorder on read and you have written LRU). There is no option to add; the no-op is the definition.
+
+`TTLEvictionPolicy` orders by **deadline**, and when the deadline gets stamped is a real open question with two legitimate answers -- Guava ships both as `expireAfterWrite` and `expireAfterAccess`. Under either one the policy is still "evict the nearest deadline"; only the stamping moment moves. That is a mode, so it's an enum.
+
+The tell is what the class is ordering by: if a read can't logically move a key along that axis, the no-op is definitional; if it can, and reasonable people would want it either way, it's a flag. And the payoff is that with a uniform TTL the two modes reproduce FIFO and LRU respectively -- the same axis `LinkedHashMap`'s `accessOrder` sits on.
 
 ---
 

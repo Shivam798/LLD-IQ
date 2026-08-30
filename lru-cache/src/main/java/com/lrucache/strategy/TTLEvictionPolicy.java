@@ -1,5 +1,7 @@
 package com.lrucache.strategy;
 
+import com.lrucache.enums.ExpiryMode;
+
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -47,17 +49,31 @@ import java.util.function.Function;
  *   TTL  : TreeMap           -> O(log n) hooks, but never needs repair at all
  *
  * Complexity: keyAdded / keyRemoved / selectEvictionCandidate are O(log n) in
- * the number of DISTINCT deadlines. keyAccessed is O(1) (it does nothing).
- * That is a genuine step down from the O(1) of LRU/LFU/FIFO, and it is not
- * avoidable: "give me the smallest of an arbitrary set of deadlines" is a
- * priority-queue problem, and priority queues cost log n. Say so out loud
- * rather than claiming O(1).
+ * the number of DISTINCT deadlines. keyAccessed is O(1) under AFTER_WRITE
+ * (it does nothing) and O(log n) under AFTER_ACCESS (it restamps). That is a
+ * genuine step down from the O(1) of LRU/LFU/FIFO, and it is not avoidable:
+ * "give me the smallest of an arbitrary set of deadlines" is a priority-queue
+ * problem, and priority queues cost log n. Say so out loud rather than
+ * claiming O(1).
  *
- * The one case where it IS O(1): if every key shares the same TTL, deadlines
- * increase monotonically with arrival, so nearest-deadline == oldest-arrival
- * and this policy degenerates into plain FIFO. Use FIFOEvictionPolicy there --
- * it gets the same answer for free. This policy earns its log n only when
- * different keys have genuinely different lifetimes.
+ * Two degenerate cases worth knowing -- both fall out of ExpiryMode
+ * -----------------------------------------------------------------
+ * If every key shares the SAME ttl, "nearest deadline" collapses into an
+ * order you already have a cheaper policy for:
+ *
+ *   AFTER_WRITE  + uniform ttl -> deadlines rise with arrival time
+ *                                 -> nearest deadline == oldest arrival
+ *                                 -> this IS FIFO
+ *   AFTER_ACCESS + uniform ttl -> deadlines rise with last-read time
+ *                                 -> nearest deadline == least recently used
+ *                                 -> this IS LRU
+ *
+ * Same policy, one enum apart -- the same axis as LinkedHashMap's accessOrder
+ * flag, which is FIFO when false and LRU when true. Both cases run at
+ * O(log n) here, so reach for FIFOEvictionPolicy or LRUEvictionPolicy
+ * instead; they reach the identical answer at O(1). This policy earns its
+ * log n only when different keys have genuinely DIFFERENT lifetimes, where
+ * neither cheap policy can express the ordering at all.
  */
 public class TTLEvictionPolicy<K> implements EvictionPolicy<K> {
 
@@ -79,29 +95,43 @@ public class TTLEvictionPolicy<K> implements EvictionPolicy<K> {
     // which bucket holds it. Without this it would scan every bucket.
     private final Map<K, Instant> deadlines = new HashMap<>();
 
+    // Whether a read restamps the deadline. AFTER_WRITE keeps keyAccessed a
+    // no-op; AFTER_ACCESS makes it move the key to a later bucket.
+    private final ExpiryMode expiryMode;
+
     /**
-     * Every key gets the same lifetime. Note this is the degenerate case --
-     * it behaves exactly like FIFO, at O(log n) instead of O(1). Useful for
-     * demonstrating the equivalence; prefer FIFOEvictionPolicy in real code.
+     * Every key gets the same lifetime, expire-after-write. Note this is a
+     * degenerate case -- it behaves exactly like FIFO at O(log n) instead of
+     * O(1). Useful for demonstrating the equivalence; prefer
+     * FIFOEvictionPolicy in real code.
      */
     public TTLEvictionPolicy(Duration uniformTtl, Clock clock) {
-        this(key -> uniformTtl, clock);
+        this(key -> uniformTtl, clock, ExpiryMode.AFTER_WRITE);
         validateTtl(uniformTtl);
     }
 
     /**
-     * Lifetime derived from the key itself, so different classes of key can
-     * have different deadlines. This is the case the policy is built for.
+     * Lifetime derived from the key itself, expire-after-write. This is the
+     * case the policy is built for.
      */
     public TTLEvictionPolicy(Function<? super K, Duration> ttlResolver, Clock clock) {
+        this(ttlResolver, clock, ExpiryMode.AFTER_WRITE);
+    }
+
+    public TTLEvictionPolicy(Function<? super K, Duration> ttlResolver, Clock clock,
+                             ExpiryMode expiryMode) {
         if (ttlResolver == null) {
             throw new IllegalArgumentException("ttlResolver is required");
         }
         if (clock == null) {
             throw new IllegalArgumentException("Clock is required");
         }
+        if (expiryMode == null) {
+            throw new IllegalArgumentException("ExpiryMode is required");
+        }
         this.ttlResolver = ttlResolver;
         this.clock = clock;
+        this.expiryMode = expiryMode;
     }
 
     /**
@@ -112,28 +142,36 @@ public class TTLEvictionPolicy<K> implements EvictionPolicy<K> {
      */
     @Override
     public void keyAdded(K key) {
-        Duration ttl = ttlResolver.apply(key);
-        validateTtl(ttl);
-        Instant deadline = clock.instant().plus(ttl);
-        deadlines.put(key, deadline);
-        byDeadline.computeIfAbsent(deadline, d -> new LinkedHashSet<>()).add(key);
+        stamp(key);
     }
 
     /**
-     * Deliberately empty -- expire-after-WRITE semantics. Reading an entry
-     * does not buy it more life, so a key's position never changes once
-     * stamped. Same reasoning as FIFO's no-op, one dimension over: FIFO
-     * ignores reads because it orders by arrival, this ignores reads because
-     * it orders by deadline, and a read moves neither.
+     * Under AFTER_WRITE this is deliberately empty: reading an entry does not
+     * buy it more life, so a key's position never changes once stamped. Same
+     * reasoning as FIFO's no-op, one dimension over -- FIFO ignores reads
+     * because it orders by arrival, this ignores them because it orders by a
+     * deadline that a read does not move.
      *
-     * Re-stamping here would give expire-after-ACCESS instead, which is a
-     * legitimate variant (Guava exposes both) but a different policy: it
-     * turns into "LRU with a clock", and a key that is polled forever would
-     * never become evictable.
+     * Under AFTER_ACCESS the deadline restarts, so the key moves to a later
+     * bucket -- unstamp then stamp, which is the same unlink-and-reinsert
+     * shape as LRU's promotion, just keyed by time instead of position. That
+     * makes the nearest deadline the least-recently-read key, which is why
+     * this mode plus a uniform ttl IS LRU.
+     *
+     * Either way the key keeps its identity in `deadlines`; nothing here can
+     * create a second entry for a key the way a stray keyAdded would.
      */
     @Override
     public void keyAccessed(K key) {
-        // no-op by design -- see javadoc
+        if (expiryMode == ExpiryMode.AFTER_WRITE) {
+            return;
+        }
+        if (unstamp(key) == null) {
+            // Not tracked -- a stale call after eviction. Do NOT stamp it:
+            // that would resurrect a key the cache no longer holds.
+            return;
+        }
+        stamp(key);
     }
 
     /**
@@ -144,22 +182,7 @@ public class TTLEvictionPolicy<K> implements EvictionPolicy<K> {
      */
     @Override
     public void keyRemoved(K key) {
-        Instant deadline = deadlines.remove(key);
-        if (deadline == null) {
-            // Not tracked -- a stale call after eviction. Tolerate silently,
-            // same as every other policy here.
-            return;
-        }
-        LinkedHashSet<K> bucket = byDeadline.get(deadline);
-        if (bucket == null) {
-            return;
-        }
-        bucket.remove(key);
-        if (bucket.isEmpty()) {
-            // Drop empty buckets so firstEntry() can never hand back an
-            // empty set.
-            byDeadline.remove(deadline);
-        }
+        unstamp(key);
     }
 
     /**
@@ -175,6 +198,49 @@ public class TTLEvictionPolicy<K> implements EvictionPolicy<K> {
             return null;
         }
         return earliest.getValue().iterator().next();
+    }
+
+    /**
+     * File the key under a fresh deadline. Absolute rather than a stored
+     * duration for the same reason CacheEntry does it: comparisons stay
+     * arithmetic-free and independent of when the check runs.
+     */
+    private void stamp(K key) {
+        Duration ttl = ttlResolver.apply(key);
+        validateTtl(ttl);
+        Instant deadline = clock.instant().plus(ttl);
+        deadlines.put(key, deadline);
+        byDeadline.computeIfAbsent(deadline, d -> new LinkedHashSet<>()).add(key);
+    }
+
+    /**
+     * Pull the key out of both structures and hand back the deadline it had,
+     * or null if it was not tracked. Shared by keyRemoved and by AFTER_ACCESS
+     * restamping, so the "both maps always agree" invariant has exactly one
+     * implementation to get right -- the same reason Cache funnels every
+     * deletion through drop().
+     *
+     * Note what is NOT here: no equivalent of LFU's recomputeMinFreq(). A
+     * TreeMap re-derives its own minimum on the next firstEntry() call, so
+     * emptying the earliest bucket needs no repair. That is what the O(log n)
+     * buys.
+     */
+    private Instant unstamp(K key) {
+        Instant deadline = deadlines.remove(key);
+        if (deadline == null) {
+            return null;
+        }
+        LinkedHashSet<K> bucket = byDeadline.get(deadline);
+        if (bucket == null) {
+            return null;
+        }
+        bucket.remove(key);
+        if (bucket.isEmpty()) {
+            // Drop empty buckets so firstEntry() can never hand back an
+            // empty set.
+            byDeadline.remove(deadline);
+        }
+        return deadline;
     }
 
     private static void validateTtl(Duration ttl) {

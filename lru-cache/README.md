@@ -203,6 +203,63 @@ classDiagram
     Cache --> ExpiryMode : expiryMode
     TTLEvictionPolicy --> ExpiryMode : expiryMode
     LRUEvictionPolicy *-- Node : nodeMap values
+
+    %% ---- second design: com.lrucache.store (value-carrying nodes) ----
+    class CacheStore~K,V~ {
+        <<interface>>
+        +get(K) Optional~V~
+        +put(K, V) Optional~K~  «returns evicted key»
+        +remove(K) Optional~V~
+        +size() int
+        +capacity() int
+        +evictionOrder() List~K~
+    }
+
+    class LruStore~K,V~ {
+        -int capacity
+        -Map~K, SNode~ table
+        -SNode head «sentinel»
+        -SNode tail «sentinel»
+        -moveToHead(SNode)
+        -addToHead(SNode)
+        -unlink(SNode)
+    }
+
+    class LfuStore~K,V~ {
+        -int capacity
+        -Map~K, SNode~ table
+        -Map~Integer, NodeList~ buckets
+        -int minFreq
+        -touch(SNode)
+        -evictLeastFrequent() K
+        -detach(SNode)
+        -bucketFor(int) NodeList
+    }
+
+    class SNode~K,V~ {
+        <<private static nested>>
+        +K key
+        +V value «carried here, not in a Cache»
+        +int freq «LFU only»
+        +SNode prev
+        +SNode next
+    }
+
+    class NodeList~K,V~ {
+        <<private static nested — one per frequency>>
+        -SNode head «sentinel»
+        -SNode tail «sentinel»
+        +addToHead(SNode)
+        +unlink(SNode)
+        +last() SNode
+        +isEmpty() boolean
+    }
+
+    LruStore ..|> CacheStore
+    LfuStore ..|> CacheStore
+    LruStore *-- SNode : table values
+    LfuStore *-- NodeList : buckets values
+    NodeList *-- SNode : bucket members
 ```
 </details>
 
@@ -406,6 +463,64 @@ That last column is the payoff. Under `AFTER_ACCESS`, the nearest deadline is th
 
 **Interview power move**: *"There are two different TTL questions and they belong in different places. 'Is this entry still true?' is correctness -- that lives on the entry and every policy inherits it. 'Who leaves when we're full?' is a policy, and answering it with 'whoever expires soonest' needs a TreeMap, not the HashMap-plus-minimum trick LFU uses -- because deadlines aren't dense integers, so there's no +1 to take. That costs me O(log n), and I'd say so rather than pretend it's O(1)."*
 
+### Layer 11: Where to draw the seam -- `EvictionPolicy<K>` vs `CacheStore<K, V>`
+
+Everything up to here split the cache in one particular place: `Cache` owns key to value,
+the policy owns key to order. That split is what makes TTL, `Clock`, `ExpiryMode` and the
+lock live in exactly one file no matter which policy is plugged in. But it has a price, and
+you should be the one to name it before the interviewer does:
+
+```java
+// strategy/ -- two maps, two hash lookups on the hot path
+Cache.get(key)               -> data.get(key)        // hash #1: the value
+                             -> policy.keyAccessed(key)
+                                  -> nodeMap.get(key) // hash #2: the node
+```
+
+The node in `LRUEvictionPolicy` knows a key but not a value, so the value has to be fetched
+separately. Two hashes, two objects, two maps to keep in lockstep.
+
+`store/` draws the seam one level higher and deletes that cost. The node carries the value:
+
+```java
+// store/ -- one map, one hash lookup
+LruStore.get(key)            -> table.get(key)       // hash #1: node.value AND node.prev/next
+                             -> moveToHead(node)     // pure pointer surgery, no lookup
+```
+
+`CacheStore<K, V>` is still a strategy -- `LruStore` and `LfuStore` are swapped the same way
+`LRUEvictionPolicy` and `LFUEvictionPolicy` are -- but now the unit you swap is the whole
+store rather than a policy sitting inside a shared `Cache`. That is the trade in one line:
+
+| | `strategy/` (`EvictionPolicy<K>`) | `store/` (`CacheStore<K, V>`) |
+|---|---|---|
+| Hashes per `get` | 2 | **1** |
+| Objects per entry | 2 (`CacheEntry` + `Node`) | **1** (`Node`) |
+| Where TTL / stats / lock live | one place, shared by all policies | re-implemented per store |
+| "Add MRU" costs | a new policy class | a new store class |
+| "Add TTL" costs | one change in `Cache` | a change in **every** store |
+
+Neither is the right answer on its own -- the right answer is knowing which pressure you are
+under. Layering (TTL, metrics, write-through, refresh-ahead) pushes toward `strategy/`;
+throughput on a hot path pushes toward `store/`. Caffeine, the production JVM cache, goes
+further than either and fuses everything into one class for exactly this reason.
+
+One more thing `store/` proves that `strategy/` does not. `LruStore` is a doubly linked list;
+`LfuStore` is a map of frequency buckets with a tracked `minFreq`. They share **no** base
+class and no data structure, and the interface mentions neither recency nor frequency nor
+nodes. If an abstraction only fits one implementation, it is that implementation wearing a
+generic name -- a second, structurally different implementation is the only real test, and
+it is why the pair here is LRU + LFU rather than LRU + FIFO (which differ by one line).
+
+The demo makes the divergence concrete -- identical call sequence, opposite victims:
+
+```
+LruStore order: [x, z, y] -> put(w) evicts x     // x was read most, but longest ago
+LfuStore order: [z, y, x] -> put(w) evicts z     // z was read last, but least often
+```
+
+---
+
 ### The Full Picture
 
 ```
@@ -429,7 +544,7 @@ EvictionPolicy<K>                 (interface -- 4 hook methods; "who leaves when
     +-- <future policy>           (MRU, ARC, 2Q -- plug in without touching Cache)
 ```
 
-> **Interview Summary**: *"I split the design into two responsibilities -- a generic `Cache<K, V>` that owns the key-to-entry HashMap, and an `EvictionPolicy<K>` strategy that owns the access-order bookkeeping. The cache calls into the policy on every event (`keyAdded`, `keyAccessed`, `keyRemoved`) and asks who to evict via `selectEvictionCandidate`. LRU uses a doubly linked list with sentinels plus a key->node HashMap for O(1) operations. LFU uses two HashMaps -- key->frequency and frequency->LinkedHashSet of keys -- plus a tracked `minFreq`, also O(1), with LRU as a free tiebreaker thanks to LinkedHashSet's insertion order. FIFO is a single LinkedHashSet in arrival order whose `keyAccessed` is deliberately empty -- that no-op is the whole policy, and it needed zero changes to `Cache`, which is the proof the split was right. TTL is deliberately NOT a policy: eviction answers 'we're full, who leaves?', TTL answers 'is this entry still true?', so expiry rides on an immutable `CacheEntry` holding an absolute `expiresAt`, and every policy inherits it for free. Expiry is lazy -- checked on read before the access is recorded, and a full cache purges dead entries before evicting a live one -- with an injected `Clock` so it's testable without sleeping. Every public method on the cache is synchronized because even `get` mutates policy state."*
+> **Interview Summary**: *"I split the design into two responsibilities -- a generic `Cache<K, V>` that owns the key-to-entry HashMap, and an `EvictionPolicy<K>` strategy that owns the access-order bookkeeping. The cache calls into the policy on every event (`keyAdded`, `keyAccessed`, `keyRemoved`) and asks who to evict via `selectEvictionCandidate`. LRU uses a doubly linked list with sentinels plus a key->node HashMap for O(1) operations. LFU uses two HashMaps -- key->frequency and frequency->LinkedHashSet of keys -- plus a tracked `minFreq`, also O(1), with LRU as a free tiebreaker thanks to LinkedHashSet's insertion order. FIFO is a single LinkedHashSet in arrival order whose `keyAccessed` is deliberately empty -- that no-op is the whole policy, and it needed zero changes to `Cache`, which is the proof the split was right. TTL is deliberately NOT a policy: eviction answers 'we're full, who leaves?', TTL answers 'is this entry still true?', so expiry rides on an immutable `CacheEntry` holding an absolute `expiresAt`, and every policy inherits it for free. Expiry is lazy -- checked on read before the access is recorded, and a full cache purges dead entries before evicting a live one -- with an injected `Clock` so it's testable without sleeping. Every public method on the cache is synchronized because even `get` mutates policy state. If throughput mattered more than layering, I'd draw the seam one level higher instead -- a `CacheStore<K, V>` where the node carries the value, which halves the hash lookups per `get` at the cost of re-implementing TTL and metrics per store; I've kept both in the repo because the interesting answer is the trade, not the pick."*
 
 ---
 
@@ -441,7 +556,7 @@ lru-cache/
 ├── README.md
 ├── class-diagram.excalidraw
 └── src/main/java/com/lrucache/
-    ├── LruCacheDemo.java                # Entry point (main) — LRU / LFU / FIFO / update / TTL demos
+    ├── LruCacheDemo.java                # Entry point (main) — LRU / LFU / FIFO / update / TTL / store demos
     │
     ├── enums/
     │   └── ExpiryMode.java              # AFTER_WRITE | AFTER_ACCESS — when the deadline is stamped
@@ -450,15 +565,25 @@ lru-cache/
     │   ├── Cache.java                   # Generic orchestrator — owns HashMap + TTL, delegates eviction
     │   └── CacheEntry.java              # Immutable value + ttl + absolute expiresAt; renewed(now)
     │
-    └── strategy/
-        ├── EvictionPolicy.java          # Strategy interface (4 hook methods)
-        ├── LRUEvictionPolicy.java       # DLL + nodeMap (Node is a private static nested class)
-        ├── LFUEvictionPolicy.java       # freqMap + freq->LinkedHashSet buckets + tracked minFreq
-        ├── FIFOEvictionPolicy.java      # LinkedHashSet in arrival order; keyAccessed is a no-op
-        ├── TTLEvictionPolicy.java       # TreeMap by deadline — evicts whatever dies soonest, O(log n)
-        │                                # AFTER_WRITE ⇒ FIFO, AFTER_ACCESS ⇒ LRU when the ttl is uniform
-        └── LinkedHashMapLRUEvictionPolicy.java  # Same LRU in 5 lines — ship it, don't lead with it
+    ├── strategy/                        # DESIGN A — policy tracks keys only; Cache owns the values
+    │   ├── EvictionPolicy.java          # Strategy interface (4 hook methods)
+    │   ├── LRUEvictionPolicy.java       # DLL + nodeMap (Node is a private static nested class)
+    │   ├── LFUEvictionPolicy.java       # freqMap + freq->LinkedHashSet buckets + tracked minFreq
+    │   ├── FIFOEvictionPolicy.java      # LinkedHashSet in arrival order; keyAccessed is a no-op
+    │   ├── TTLEvictionPolicy.java       # TreeMap by deadline — evicts whatever dies soonest, O(log n)
+    │   │                                # AFTER_WRITE ⇒ FIFO, AFTER_ACCESS ⇒ LRU when the ttl is uniform
+    │   └── LinkedHashMapLRUEvictionPolicy.java  # Same LRU in 5 lines — ship it, don't lead with it
+    │
+    └── store/                           # DESIGN B — store owns K→V itself; node carries the value
+        ├── CacheStore.java              # Strategy interface, one hash lookup per operation
+        ├── LruStore.java                # HashMap<K,Node> + one DLL, sentinel-bounded
+        └── LfuStore.java                # HashMap<K,Node> + freq→NodeList buckets + tracked minFreq
 ```
+
+> `strategy/` and `store/` are two answers to the same question, kept side by side on
+> purpose. `strategy/` splits storage from ordering (`Cache` + `EvictionPolicy<K>`) and
+> buys a place to layer TTL, stats and locking once. `store/` fuses them
+> (`CacheStore<K,V>`) and buys a single hash lookup per operation. See Layer 11.
 
 ---
 
@@ -472,6 +597,8 @@ lru-cache/
 | **Composition** | `Cache` owns `EvictionPolicy` | Cache delegates ordering decisions |
 | **Value Object** | `CacheEntry<V>` (immutable value + `expiresAt`) | TTL rides on the stored entry, so every policy inherits expiry for free |
 | **Dependency Injection** | `Clock` passed into `Cache` | Makes TTL deterministic and testable without `Thread.sleep` |
+| **Strategy (higher seam)** | `CacheStore` + `LruStore` / `LfuStore` | Same pattern, swapped one level up: the store owns `K -> V` itself, so `get` costs one hash instead of two |
+| **Sentinel Node (again)** | `LruStore` head/tail, and one pair per `LfuStore` bucket | LFU needs many lists -- one per frequency -- so the list is extracted into its own `NodeList` type |
 
 ---
 
@@ -483,7 +610,8 @@ lru-cache/
 | **OCP** | FIFO was added as a new `EvictionPolicy` implementation with **zero** edits to `Cache` -- MRU / ARC would be the same. |
 | **LSP** | Anywhere `EvictionPolicy<K>` is expected, LRU, LFU and FIFO are all drop-in -- including FIFO, whose `keyAccessed` does nothing (a no-op honours the contract; it does not break it). |
 | **ISP** | Interface has exactly the four methods needed to express any access-order policy -- no fat. |
-| **DIP** | `Cache` depends on `EvictionPolicy` abstraction, not on `LRUEvictionPolicy` concrete class. |
+| **DIP** | `Cache` depends on `EvictionPolicy` abstraction, not on `LRUEvictionPolicy` concrete class. Callers of `store/` depend on `CacheStore<K, V>`, never on `LruStore` or `LfuStore`. |
+| **ISP (second proof)** | `CacheStore` names no data structure -- not recency, not frequency, not nodes -- which is why a linked list and a bucket map both satisfy it without a shared base class. An interface only one implementation can satisfy is not an abstraction. |
 
 ---
 
@@ -494,6 +622,7 @@ lru-cache/
 - For a higher-concurrency variant, swap `synchronized` for a `ReentrantLock`, or shard the cache (a-la Guava `LoadingCache`) so each shard holds its own lock.
 - TTL adds no new locking: expiry is checked inside the already-synchronized `get` / `put`, and `purgeExpired()` is synchronized too. There is no sweeper thread, so there is no second thread to coordinate with.
 - Each operation reads `clock.instant()` **once** and judges every entry it touches against that single instant, so a bulk purge can never be internally inconsistent (no entry surviving because time moved mid-loop).
+- In `store/` there is no separate `Cache` to hold the lock, so each store synchronizes itself. `get` is synchronized there for the same reason it is here: an LRU `get` relinks the list and an LFU `get` moves a node between frequency buckets. A read is a write.
 - `purgeExpired` collects victim keys first and deletes afterwards -- `policy.keyRemoved` is a call into foreign code, and invoking it mid-iteration over `data` is how `ConcurrentModificationException` bugs are born.
 
 ---
@@ -506,6 +635,7 @@ lru-cache/
 - **Expire-after-access instead of expire-after-write** -> **built in.** Pass `ExpiryMode.AFTER_ACCESS` to `Cache` (and to `TTLEvictionPolicy` if you're using it), and reads restamp the deadline instead of leaving it fixed.
 - **Cache statistics** (hit rate, miss rate) -> add counters on `Cache` and expose `stats()`.
 - **Listeners on eviction** -> add an `EvictionListener<K, V>` interface and call it from `Cache.put` right before `data.remove(victim)`.
+- **New store** (MRU, random, 2Q, ...) -> implement `CacheStore<K, V>` in `store/`. Nothing else changes. Note the asymmetry: a new *policy* is cheap and a new *cross-cutting feature* is cheap in `strategy/`; in `store/` a new store is cheap but a new cross-cutting feature costs one edit per store. Pick the package by which axis you expect to move.
 - **Higher concurrency** -> replace `synchronized` with `ReentrantLock` (allows tryLock + timeout) or shard the cache by key hash so each shard locks independently.
 
 ---
@@ -731,6 +861,30 @@ Because they are empty for different reasons. FIFO orders by **arrival**, and a 
 `TTLEvictionPolicy` orders by **deadline**, and when the deadline gets stamped is a real open question with two legitimate answers -- Guava ships both as `expireAfterWrite` and `expireAfterAccess`. Under either one the policy is still "evict the nearest deadline"; only the stamping moment moves. That is a mode, so it's an enum.
 
 The tell is what the class is ordering by: if a read can't logically move a key along that axis, the no-op is definitional; if it can, and reasonable people would want it either way, it's a flag. And the payoff is that with a uniform TTL the two modes reproduce FIFO and LRU respectively -- the same axis `LinkedHashMap`'s `accessOrder` sits on.
+
+---
+
+### `store/` questions (asked when you show the second design)
+
+### Q27. You already had a Strategy. Why is `CacheStore` a second one instead of another `EvictionPolicy`?
+
+Because it answers a different question. `EvictionPolicy<K>` answers *"given a set of keys, who leaves?"* -- it never sees a value, which is exactly why `Cache` has to look the value up separately. `CacheStore<K, V>` answers *"be a bounded map"*, so it owns the node, and the node owns the value. Same pattern, seam moved one level up. The observable difference is one hash lookup per `get` instead of two, and one object per entry instead of two.
+
+### Q28. Then why keep `EvictionPolicy` at all? Just use the faster one.
+
+Because the two designs are cheap on opposite axes. Adding MRU to `strategy/` is a new class; adding MRU to `store/` is also a new class -- a tie. But adding TTL to `strategy/` was **one** change in `Cache` that every policy inherited for free, while adding TTL to `store/` means writing it into `LruStore` and `LfuStore` separately, and into every store after that. Cross-cutting features -- TTL, stats, eviction listeners, write-through, the lock itself -- want a shared orchestrator. Throughput wants the fused node. Naming which axis you expect to move is the actual answer; picking one without naming it is the wrong one.
+
+### Q29. Why LRU + LFU as the two stores rather than LRU + FIFO?
+
+FIFO and LRU differ by literally one thing -- whether `get` promotes the node -- so they'd share a base class and prove almost nothing about the interface. LRU and LFU share **no** data structure: one is a single doubly linked list, the other is a map of frequency buckets plus a tracked `minFreq`. If `CacheStore` had accidentally been shaped around a linked list, LFU would not fit it. Two structurally different implementations are the only real test that an interface is an abstraction and not one implementation wearing a generic name.
+
+### Q30. Why does `put` return `Optional<K>` instead of `void`?
+
+The evicted key is information the caller often needs and can never recover afterwards -- it's gone from the store by the time `put` returns. Returning it is what makes write-through, eviction listeners and metrics possible without adding a callback interface. It's also the honest signature: `put` on a full store is two operations, and hiding one of them behind `void` makes the API look cheaper than it is. Note `Optional.empty()` covers both "there was room" and "the key already existed, so nothing was evicted" -- an update is never an eviction, which is Trap 1 restated at the store level.
+
+### Q31. `LfuStore.remove` recomputes `minFreq`, but `LruStore.remove` does no such repair. Why the asymmetry?
+
+`LruStore` has no derived state -- the list *is* the order, so unlinking a node leaves it correct by construction. `LfuStore` caches a derived fact, `minFreq`, and any cached fact can go stale. Removing the last node at the minimum frequency empties that bucket without promoting anything into the next one, so `minFreq` points at a bucket that no longer exists. In practice it's currently unobservable -- a `remove` drops size below capacity, so the next `put` inserts (resetting `minFreq` to 1) rather than evicting -- but that is a two-hop argument about what *another method* happens to do. Repairing it in `remove` makes "`minFreq` is the smallest live frequency" true at all times, so `evictLeastFrequent` can trust it locally. It's `O(distinct frequencies)` and off the hot path. LeetCode 460 has no `remove`, so the question never arises there.
 
 ---
 

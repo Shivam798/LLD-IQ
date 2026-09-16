@@ -7,11 +7,15 @@ import com.lrucache.strategy.LFUEvictionPolicy;
 import com.lrucache.strategy.LinkedHashMapLRUEvictionPolicy;
 import com.lrucache.strategy.TTLEvictionPolicy;
 import com.lrucache.strategy.LRUEvictionPolicy;
+import com.lrucache.store.CacheStore;
+import com.lrucache.store.LfuStore;
+import com.lrucache.store.LruStore;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
+import java.util.List;
 
 public class LruCacheDemo {
 
@@ -31,6 +35,8 @@ public class LruCacheDemo {
         runTTLEviction();
         System.out.println();
         runExpireAfterAccess();
+        System.out.println();
+        runValueCarryingStores();
     }
 
     private static void runLRU() {
@@ -277,6 +283,72 @@ public class LruCacheDemo {
         System.out.println("  get(1) = " + asLru.get(1).orElse("EVICTED")
                 + ", get(3) = " + asLru.get(3).orElse("EVICTED")
                 + ", get(4) = " + asLru.get(4).orElse("EVICTED"));
+    }
+
+    /**
+     * The second design in this module: com.lrucache.store.
+     *
+     * Everywhere above, Cache owns key -> value and an EvictionPolicy<K> owns
+     * key -> recency -- two maps, two hash lookups per get(). Here the store
+     * owns a node that carries the value, so get() hashes once. The cost is
+     * that eviction is no longer a knob inside a shared Cache; the whole store
+     * is the knob.
+     *
+     * The point of this section is the loop: identical call sequence, one
+     * interface, two completely different data structures underneath, two
+     * different survivors.
+     */
+    private static void runValueCarryingStores() {
+        System.out.println("=== Value-carrying stores: one interface, two structures ===");
+
+        for (CacheStore<String, String> store : List.of(
+                new LruStore<String, String>(3),
+                new LfuStore<String, String>(3))) {
+
+            String name = store.getClass().getSimpleName();
+
+            store.put("a", "apple");
+            store.put("b", "banana");
+            store.put("c", "cherry");
+
+            // 'a' is read twice, 'b' once, 'c' never again.
+            store.get("a");
+            store.get("a");
+            store.get("b");
+
+            System.out.println(name + " evicts in order " + store.evictionOrder());
+
+            // Both agree here -- 'c' is simultaneously the stalest and the
+            // least used, so recency and frequency point at the same victim.
+            // The second half of this demo builds the case where they don't.
+            String evicted = store.put("d", "date").orElse("nothing");
+            System.out.println(name + " put(d) evicted: " + evicted);
+            System.out.println(name + " get(c) = " + store.get("c").orElse("EVICTED"));
+            System.out.println();
+        }
+
+        // Where the two genuinely disagree: 'x' is read many times but long
+        // ago, 'z' was read once but just now.
+        System.out.println("--- same sequence, opposite victims ---");
+        CacheStore<String, String> lru = new LruStore<>(3);
+        CacheStore<String, String> lfu = new LfuStore<>(3);
+        for (CacheStore<String, String> store : List.of(lru, lfu)) {
+            store.put("x", "hot-but-old");
+            store.put("y", "middling");
+            store.put("z", "cold-but-recent");
+            store.get("x");
+            store.get("x");
+            store.get("x");   // x: used 4 times
+            store.get("y");   // y: used 2 times
+            store.get("z");   // z: used 2 times, and most recently
+            store.get("y");   // y: used 3 times -- now y is MRU
+        }
+        // LRU sees z as stalest of the three reads; LFU sees z as least used.
+        System.out.println("LruStore order: " + lru.evictionOrder()
+                + " -> put(w) evicts " + lru.put("w", "new").orElse("nothing"));
+        System.out.println("LfuStore order: " + lfu.evictionOrder()
+                + " -> put(w) evicts " + lfu.put("w", "new").orElse("nothing"));
+        System.out.println("Same calls, different victim: that is the strategy earning its keep.");
     }
 
     /**

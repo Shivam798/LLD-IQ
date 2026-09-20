@@ -1,6 +1,6 @@
 # Notification Service — Low Level Design
 
-A multi-channel notification service that delivers a message over **Email, SMS, or Push** through a single, channel-agnostic entry point — with pluggable channels, transparent retry, and observable delivery status.
+A multi-channel notification service that delivers a message over **Email, SMS, or Push** through a single, channel-agnostic entry point — with pluggable channels and observable delivery status.
 
 ---
 
@@ -9,7 +9,6 @@ A multi-channel notification service that delivers a message over **Email, SMS, 
 Design a notification service that:
 - Sends a notification to a recipient over a chosen **channel** (Email / SMS / Push)
 - Lets new channels be **added without touching existing code**
-- Retries **transient delivery failures** without each channel reimplementing retry
 - Tracks each notification's **lifecycle** (PENDING → SENT / FAILED) and lets independent components (logging, metrics, audit) react to it
 - Exposes **one simple entry point** (`send(notification)`) regardless of channel
 - Is safe to call from multiple threads
@@ -29,13 +28,9 @@ service.send(notification)
     |        |
     |        +-- EMAIL -> EmailSender
     |        +-- SMS   -> SmsSender
-    |        +-- PUSH  -> PushSender   (may be wrapped in RetrySenderDecorator)
+    |        +-- PUSH  -> PushSender
     |
     +-- delivered = sender.send(notification)
-    |        |
-    |        +-- RetrySenderDecorator: loop up to maxAttempts
-    |        |        +-- delegate.send() == true  -> return true
-    |        |        +-- false / throw            -> try again
     |        |
     |        +-- concrete sender: read the channel-specific address, deliver
     |
@@ -118,18 +113,6 @@ classDiagram
         +getSender(ChannelType) NotificationSender
     }
 
-    class NotificationSenderDecorator {
-        <<abstract>>
-        #delegate: NotificationSender
-        +send(Notification) boolean
-        +getChannelType() ChannelType
-    }
-
-    class RetrySenderDecorator {
-        -maxAttempts: int
-        +send(Notification) boolean
-    }
-
     class NotificationObserver {
         <<interface>>
         +onStatusChange(Notification, NotificationStatus)
@@ -164,9 +147,6 @@ classDiagram
     EmailSender ..|> NotificationSender
     SmsSender ..|> NotificationSender
     PushSender ..|> NotificationSender
-    NotificationSenderDecorator ..|> NotificationSender
-    RetrySenderDecorator --|> NotificationSenderDecorator
-    NotificationSenderDecorator o-- NotificationSender : wraps
     LoggingObserver ..|> NotificationObserver
     MetricsObserver ..|> NotificationObserver
 
@@ -191,7 +171,7 @@ The trap in "design a notification service" is to start writing an `EmailService
 
 **What**: Sending an email, an SMS, and a push notification are the *same operation* — `send(notification)` — differing only in the transport. That's the textbook signature of the **Strategy pattern**: one interface (`NotificationSender`), many interchangeable implementations.
 
-**Why it matters**: It stops you from writing three unrelated service classes with duplicated orchestration. The thing that varies (the transport) gets isolated behind an interface; everything that doesn't vary (status tracking, retry, logging) is written once.
+**Why it matters**: It stops you from writing three unrelated service classes with duplicated orchestration. The thing that varies (the transport) gets isolated behind an interface; everything that doesn't vary (status tracking, logging) is written once.
 
 **Power move**: *"Email, SMS and push aren't three features — they're three implementations of one `send` contract. I'll model the channel as a Strategy."*
 
@@ -221,25 +201,15 @@ The trap in "design a notification service" is to start writing an `EmailService
 
 **Power move**: *"Status changes are events. The service publishes them; logging and metrics subscribe. That keeps delivery, logging and metering as three independent classes."*
 
-### Layer 5: Retry is a cross-cutting concern — Decorator, not a loop in every sender
-
-**What**: Delivery fails transiently (gateway blip, network hiccup). Retrying usually fixes it. But retry applies *equally* to email, SMS and push — so where does the loop live?
-
-**Why a decorator**: If each sender has its own retry loop, the logic is triplicated and each sender violates SRP (its job is to send *once*). Instead, `RetrySenderDecorator` **wraps** any `NotificationSender` and re-invokes it up to `maxAttempts`. Because the decorator implements the same interface it wraps, the service (and the factory) can't tell a decorated sender from a bare one — you can even register the wrapped sender back into the factory and nothing else changes.
-
-**The interview-grade detail**: real retries need **exponential backoff + jitter** between attempts, or a downstream outage gets hammered by synchronised retries. The code calls this out where the sleep would go.
-
-**Power move**: *"Retry is cross-cutting, so it's a Decorator — one class, wraps any channel, and the service is oblivious because the wrapper IS a `NotificationSender`."*
-
-### Layer 6: One way in — Singleton service as a thin router
+### Layer 5: One way in — Singleton service as a thin router
 
 **What**: `NotificationService` is the single public entry point. It owns the factory and the observer registry, and it's a double-checked-locking **Singleton** with a `volatile` instance.
 
-**Why it stays thin**: `send()` does exactly four things — mark PENDING, look up the sender, delegate, mark SENT/FAILED — and *nothing else*. Grep it for `"smtp"` or `"retry"` and you find nothing: channels live in senders, retry lives in a decorator, logging/metrics live in observers. That emptiness is the whole design paying off.
+**Why it stays thin**: `send()` does exactly four things — mark PENDING, look up the sender, delegate, mark SENT/FAILED — and *nothing else*. Grep it for `"smtp"` and you find nothing: channels live in senders, logging/metrics live in observers. That emptiness is the whole design paying off.
 
 **The concurrency story**: the singleton uses `volatile` + double-checked locking; the observer list is copy-on-write; the metrics counters are `AtomicLong`; the notification id is an `AtomicLong`; `status` is `volatile`. Each shared-state touchpoint has a deliberate, minimal synchronisation choice.
 
-**Power move**: *"The service is a router. It knows the *sequence* — pending, send, done — but delegates every *decision* to a strategy, a decorator, or an observer."*
+**Power move**: *"The service is a router. It knows the *sequence* — pending, send, done — but delegates every *decision* to a strategy or an observer."*
 
 ### The Full Picture
 
@@ -248,7 +218,6 @@ NotificationService (Singleton)                  one entry point: send(notificat
     |  owns
     +-- NotificationSenderFactory   (Factory)    ChannelType -> NotificationSender
     |        +-- EmailSender / SmsSender / PushSender   (Strategy)
-    |        +-- RetrySenderDecorator(...)              (Decorator wraps a sender)
     |
     +-- List<NotificationObserver>  (Observer)   reacts to every status change
              +-- LoggingObserver
@@ -257,7 +226,7 @@ NotificationService (Singleton)                  one entry point: send(notificat
 Notification (built via Builder)  --carries-->  Recipient, ChannelType, Priority, status
 ```
 
-> **Interview Summary**: *"I split the design into a thin `NotificationService` orchestrator and the concerns hanging off it. Each delivery channel is a `NotificationSender` Strategy, and a `NotificationSenderFactory` maps the `ChannelType` enum to the right sender so adding a channel never edits the service. A `Notification` is built with a Builder because it has required plus optional fields and should be immutable apart from its status. Status transitions (PENDING → SENT/FAILED) are published to `NotificationObserver`s, so logging and metrics live outside the service as independent subscribers. Retry is a cross-cutting concern, so it's a `RetrySenderDecorator` that wraps any sender transparently — with exponential backoff and jitter in production. The service itself is a double-checked-locking Singleton that just sequences pending → send → done and delegates every actual decision. The whole thing is Open/Closed: new channel = new sender, new reaction = new observer, new reliability policy = new decorator, with zero edits to the orchestrator."*
+> **Interview Summary**: *"I split the design into a thin `NotificationService` orchestrator and the concerns hanging off it. Each delivery channel is a `NotificationSender` Strategy, and a `NotificationSenderFactory` maps the `ChannelType` enum to the right sender so adding a channel never edits the service. A `Notification` is built with a Builder because it has required plus optional fields and should be immutable apart from its status. Status transitions (PENDING → SENT/FAILED) are published to `NotificationObserver`s, so logging and metrics live outside the service as independent subscribers. The service itself is a double-checked-locking Singleton that just sequences pending → send → done and delegates every actual decision. The whole thing is Open/Closed: new channel = new sender, new reaction = new observer, with zero edits to the orchestrator."*
 
 ---
 
@@ -290,10 +259,6 @@ notification-service/
     ├── factory/
     │   └── NotificationSenderFactory.java         # ChannelType -> sender (EnumMap, register())
     │
-    ├── decorator/                                 # Decorator pattern
-    │   ├── NotificationSenderDecorator.java       # Abstract base, forwards to delegate
-    │   └── RetrySenderDecorator.java              # Adds retry to ANY sender
-    │
     └── observer/                                  # Observer pattern
         ├── NotificationObserver.java              # Observer interface
         ├── LoggingObserver.java                    # Logs every status transition
@@ -311,7 +276,6 @@ notification-service/
 | **Factory** | `NotificationSenderFactory` | Maps `ChannelType` → sender; new channel = one `register()`, no service edit |
 | **Builder** | `Notification.Builder` | Required + optional fields, validated, yielding an immutable object |
 | **Observer** | `NotificationObserver` + Logging/Metrics | Logging & metrics react to status changes without the service knowing |
-| **Decorator** | `RetrySenderDecorator` | Adds retry to any sender transparently; the service can't tell it's wrapped |
 
 ---
 
@@ -319,9 +283,9 @@ notification-service/
 
 | Principle | How |
 |-----------|-----|
-| **SRP** | Service routes; senders deliver; decorator retries; observers log/meter; builder constructs. Each has one reason to change. |
-| **OCP** | New channel → new `NotificationSender` + `register()`. New reaction → new observer. New reliability policy → new decorator. Zero edits to `NotificationService`. |
-| **LSP** | Every `NotificationSender` (bare or decorated) is substitutable; the service never type-checks. A `RetrySenderDecorator` stands in wherever a sender is expected. |
+| **SRP** | Service routes; senders deliver; observers log/meter; builder constructs. Each has one reason to change. |
+| **OCP** | New channel → new `NotificationSender` + `register()`. New reaction → new observer. Zero edits to `NotificationService`. |
+| **LSP** | Every `NotificationSender` is substitutable; the service never type-checks — it calls `send()` on whatever the factory returns. |
 | **ISP** | `NotificationSender` has two focused methods; `NotificationObserver` has one. No fat interfaces. |
 | **DIP** | `NotificationService` depends on the `NotificationSender` and `NotificationObserver` abstractions and the factory, never on a concrete sender. |
 
@@ -342,7 +306,7 @@ notification-service/
 
 - **New channel** (WhatsApp, Slack, voice call) → implement `NotificationSender`, call `factory.register(...)`. No changes to the service.
 - **New reaction to delivery** (audit trail, dead-letter queue, Slack alert on failure) → implement `NotificationObserver`, call `service.addObserver(...)`.
-- **New reliability policy** (rate limiting, circuit breaker, deduplication) → write another `NotificationSenderDecorator` and stack it: `new RateLimitDecorator(new RetrySenderDecorator(sender, 3))`.
+- **New reliability policy** (retry, rate limiting, circuit breaker) → wrap a sender in a **Decorator** that implements `NotificationSender` and delegates; because the wrapper *is* a sender it registers back into the factory and nothing else changes.
 - **User preferences / channel fallback** ("try push, fall back to SMS, then email") → a **Chain of Responsibility** of senders, or a `PreferenceResolver` consulted before routing. The strategy/factory split makes this a layer on top, not a rewrite.
 - **Async / high throughput** → enqueue notifications onto a queue and have a worker pool call `send()`; priority drives queue ordering. The `Priority` enum is already in place for this.
 - **Templating** → add a `MessageTemplate` + a Template Method or a formatter Strategy to render `body`/`subject` from a template id + variables.
@@ -357,22 +321,19 @@ An `if/else` (or `switch`) on channel type concentrates every channel's logic in
 ### Q2. Why a Factory on top of the Strategy — isn't the interface enough?
 The interface decouples *use* from *implementation*; the factory decouples *selection* from *construction*. Without it, the service would `new EmailSender()` itself and thus depend on concrete classes (a DIP violation) and edit itself for every channel (an OCP violation). The factory is the single place that knows `enum → concrete sender`.
 
-### Q3. Why is retry a Decorator instead of a method on the service or a loop in each sender?
-Retry is cross-cutting — it applies to every channel identically. A loop in each sender triplicates the logic and makes "send once" senders also own a retry policy (SRP violation). A method on the service hard-codes one policy for everyone. A Decorator wraps any sender, lives in one class, is independently testable, and stacks with other decorators (rate limit, circuit breaker). Because it implements `NotificationSender`, nothing downstream knows it's there.
-
-### Q4. How does the service stay unaware of logging and metrics?
+### Q3. How does the service stay unaware of logging and metrics?
 Observer pattern. The service publishes status transitions to a list of `NotificationObserver`s and calls `onStatusChange`. Logging and metrics are just subscribers. The service has no `import` of any logger or metrics library — adding or removing a reaction never touches it.
 
-### Q5. Why Builder for `Notification` rather than constructors?
+### Q4. Why Builder for `Notification` rather than constructors?
 Three required fields and two optional ones means either a telescoping set of constructors (unreadable call sites) or a mutable POJO (no immutability). The Builder makes required fields un-skippable, optional fields fluent and self-documenting, validates in `build()`, and produces an object that's immutable apart from `status`.
 
-### Q6. How would you add "send over the user's preferred channel, falling back if it fails"?
+### Q5. How would you add "send over the user's preferred channel, falling back if it fails"?
 Model the fallback as a **Chain of Responsibility** of senders (push → SMS → email), each forwarding to the next on failure; or resolve the ordered channel list from a `PreferenceResolver` and loop. Either way it's a layer *above* the existing strategy/factory — no change to the senders themselves.
 
-### Q7. How does this scale to millions of notifications a second?
+### Q6. How does this scale to millions of notifications a second?
 Make it asynchronous: `send()` enqueues onto a (possibly distributed) queue keyed by `Priority`, and a worker pool drains it calling the same senders. Add backpressure and batching at the gateway. The synchronous core here is the per-notification logic; the queue is an orthogonal throughput concern that reuses every class unchanged.
 
-### Q8. What happens to a notification that fails every retry?
+### Q7. What happens to a notification that fails to deliver?
 It ends in `FAILED`, and the status change is broadcast to observers — so a `DeadLetterObserver` could persist it for later replay, and a metrics/alerting observer could fire if the failure rate crosses a threshold. The point is that handling failure is *also* just another observer, not new logic inside the service.
 
 ---
@@ -381,22 +342,22 @@ It ends in `FAILED`, and the status change is broadcast to observers — so a `D
 
 > Interviewers treat these keywords as an invitation. The moment they spot `volatile NotificationStatus status` or `AtomicLong`, they ask *"why that and not the other?"* See **[CONCURRENCY-GUIDE.md](../CONCURRENCY-GUIDE.md)** for the full explanations; the rapid-fire versions:
 
-### Q9. `Notification.status` is `volatile` — why, and what does it actually guarantee?
+### Q8. `Notification.status` is `volatile` — why, and what does it actually guarantee?
 `volatile` gives the **visibility guarantee**: a write is flushed to main memory immediately and every read goes to main memory, not a per-core CPU cache. So once the sending thread sets `SENT`, any thread that reads afterwards sees `SENT`, never a stale `PENDING`. It does **not** make compound actions atomic — it's right here only because `status` is a simple flag written by one thread and read by others.
 
-### Q10. When is `volatile` *not* enough — when do you need `synchronized` / `Atomic`?
+### Q9. When is `volatile` *not* enough — when do you need `synchronized` / `Atomic`?
 When you do a **read-modify-write** (`x = next(x)`, `count++`) or must update **several fields together**. `volatile` orders single reads/writes but `count++` is three steps (read, add, write) and two threads can interleave and lose an update. Then you need `synchronized` (lock) or an `Atomic*` (lock-free CAS).
 
-### Q11. Why `AtomicLong` for the id sequence instead of a plain `long counter++`?
+### Q10. Why `AtomicLong` for the id sequence instead of a plain `long counter++`?
 `counter++` is read-add-write — two threads can both read `5`, both write `6`, producing **duplicate ids**. `AtomicLong.getAndIncrement()` performs that as one atomic, uninterruptible operation, so every caller gets a unique, gap-free number under concurrency. (Note: `getAndIncrement()` returns the value *before* bumping, so `new AtomicLong(1)` makes the first id `1`.)
 
-### Q12. `AtomicLong` vs a `synchronized` counter — which and why?
+### Q11. `AtomicLong` vs a `synchronized` counter — which and why?
 Both are correct. `synchronized` takes a **lock** (other threads block); `AtomicLong` is **lock-free**, using a hardware compare-and-swap. For a single-variable counter the atomic is cheaper and never blocks. Reach for `synchronized` when you must coordinate **multiple fields** or a multi-step operation as one unit.
 
-### Q13. How does `AtomicLong` work internally with no lock?
+### Q12. How does `AtomicLong` work internally with no lock?
 A `volatile long value` (visibility) + **CAS (compare-and-swap)**, a single CPU instruction (`LOCK CMPXCHG`) that sets the value *only if it still equals what was last read*. `getAndIncrement()` loops: read, compute next, CAS; if another thread won the race the CAS fails and it retries. No thread sleeps — that's "optimistic, lock-free" concurrency vs `synchronized`'s "pessimistic" locking.
 
-### Q14. Why double-checked locking + `volatile` on the singleton instance?
+### Q13. Why double-checked locking + `volatile` on the singleton instance?
 The first null-check avoids taking the lock on the hot path; the lock + second check ensure only one instance is built. The `instance` field is `volatile` so a **half-constructed** object (object reference assigned before its constructor finishes, due to instruction reordering) can never be seen by another thread.
 
 ### Q15. Why `CopyOnWriteArrayList` for observers instead of a plain `ArrayList` or a `synchronized` list?

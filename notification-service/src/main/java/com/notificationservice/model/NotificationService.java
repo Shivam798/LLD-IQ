@@ -19,13 +19,13 @@ import java.util.concurrent.CopyOnWriteArrayList;
  * What it actually does (and deliberately nothing more):
  *   1. mark the notification PENDING and tell observers;
  *   2. ask the factory for the sender that handles this channel;
- *   3. delegate the send (the sender may itself be a retry decorator);
+ *   3. delegate the send to that sender;
  *   4. mark SENT or FAILED and tell observers.
  *
  * Notice what it does NOT do: it has no idea how email differs from SMS
- * (that's the senders), no retry loop (that's a decorator), no logging or
- * metrics (those are observers). It's a thin router — grep it for "smtp"
- * or "retry" and you'll find nothing. That emptiness is the design working.
+ * (that's the senders), and no logging or metrics (those are observers).
+ * It's a thin router — grep it for "smtp" and you'll find nothing. That
+ * emptiness is the design working.
  */
 public class NotificationService {
 

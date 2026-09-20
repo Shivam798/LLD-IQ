@@ -15,16 +15,15 @@ import com.notificationservice.model.Notification;
  *   - send()           : do the delivery, return success/failure.
  *   - getChannelType() : lets the factory index senders by channel.
  *
- * send() returns a boolean rather than void so a wrapper (the retry
- * decorator) can observe failure and react. We return false / throw on
- * transient failure — the decorator turns that into a retry.
+ * send() returns a boolean rather than void so the caller can tell a
+ * failed delivery from a successful one and record the right terminal
+ * status instead of guessing.
  */
 public interface NotificationSender {
 
     /**
      * Attempt to deliver. Returns true on success, false on a failure the
-     * caller may choose to retry. Implementations may also throw for
-     * unexpected errors — the retry decorator treats both the same way.
+     * caller may choose to retry.
      */
     boolean send(Notification notification);
 

@@ -34,6 +34,7 @@
         <module>notification-service</module>
         <module>meeting-room-booking</module>
         <module>task-scheduler</module>
+        <module>hashmap</module>
     </modules>
 
     <build>

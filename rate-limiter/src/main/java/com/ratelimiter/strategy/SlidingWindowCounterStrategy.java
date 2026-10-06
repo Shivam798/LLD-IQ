@@ -29,6 +29,11 @@ package com.ratelimiter.strategy;
  *   the rolling view, plus everything we've seen so far in the current
  *   window. It's a linear interpolation between two fixed-window counts.
  *
+ *   As the current window fills, overlapFraction decays smoothly from
+ *   1.0 (just rolled, previous counts fully) to 0.0 (previous about to
+ *   drop off). That smooth decay, instead of Fixed Window's cliff-style
+ *   reset, is exactly what kills the boundary-burst bug.
+ *
  * Accuracy:
  *   - Worst case error vs. true sliding-window-log: ~0.003% on average
  *     for typical traffic, can spike if traffic is hyper-bursty inside
@@ -95,52 +100,14 @@ public class SlidingWindowCounterStrategy implements RateLimitStrategy {
         }
 
         // Step 2: check -- is the rolling estimate already at the limit?
-        //
-        // We never stored individual timestamps -- we only have two window
-        // counts. To answer "how many requests in the last windowMillis?"
-        // we LINEARLY INTERPOLATE between them, assuming the previous
-        // window's hits were spread uniformly across it.
-
-        // (a) How far are we into the current window?
-        // currentWindow * windowMillis = start time of the current window;
-        // subtracting from `now` gives ms consumed inside the current window.
-        // e.g. windowMillis = 60_000, currentWindow = 100, now is 18s into
-        // that window  ->  elapsedInCurrent = 18_000.
-        long elapsedInCurrent = now - currentWindow * windowMillis;
-
-        // (b) Fraction of the PREVIOUS window still in the rolling view
-        //     [now - windowMillis, now].
-        //
-        //   elapsedInCurrent / windowMillis = fraction of current window already consumed.
-        //   `1 - that`                      = fraction of previous window still in view.
-        //
-        // Timeline (30% into current window):
-        //   |--- previous ---|--- current ---|
-        //                ^                ^
-        //                |                now
-        //                start of rolling view = now - windowMillis
-        //   -> overlapFraction = 0.70 (last 70% of previous is still visible,
-        //      first 30% has already slid out).
-        //
-        // Edge cases:
-        //   elapsedInCurrent = 0            -> overlap = 1.0 (just rolled, previous counts fully)
-        //   elapsedInCurrent ~ windowMillis -> overlap -> 0.0 (previous about to drop off)
-        double overlapFraction = 1.0 - ((double) elapsedInCurrent / windowMillis);
-
-        // (c) Blend the two counts.
-        //   currentCount  -> every hit in current window is FULLY in view, counts as-is.
-        //   previousCount -> only `overlapFraction` of it is still in view, and under
-        //                    the uniform-distribution assumption that same fraction
-        //                    of its hits are in view.
-        //
-        // This is what makes the limit "slide" instead of resetting cliff-style at
-        // the window boundary -- the previous window's contribution decays smoothly
-        // toward zero as the current window fills. That decay is exactly what kills
-        // the Fixed Window boundary-burst bug.
-        //
-        // Worked example, maxRequests = 100:
-        //   currentCount = 20, previousCount = 80, overlap = 0.70
-        //   estimate = 20 + 80 * 0.70 = 76  -> under limit, allow.
+        // The rolling view [now - windowMillis, now] holds all of the
+        // current window plus the last `overlapFraction` of the previous
+        // one (see the timeline in the class javadoc). Assuming the
+        // previous window's hits were spread uniformly, that same fraction
+        // of previousCount is still in view.
+        //   e.g. 30% into current window -> overlapFraction = 0.7
+        //        max 100, current 20, previous 80 -> 20 + 80 * 0.7 = 76 -> allow
+        double overlapFraction = 1.0 - (double) (now % windowMillis) / windowMillis;
         double estimate = currentCount + previousCount * overlapFraction;
         if (estimate >= maxRequests) {
             return false;

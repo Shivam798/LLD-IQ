@@ -87,28 +87,32 @@ limiter.allow(clientId)
     |        |
     |        +-- subsequent calls         --> reuse existing instance
     |
-    +-- strategy.allow()
+    +-- strategy.allow()            every algorithm: 1. catch up  2. check  3. consume
              |
              +-- Fixed Window Counter
-             |        +-- if (now - windowStart) >= windowMillis : reset counter
-             |        +-- count < max ? count++, return true : return false
+             |        +-- 1. window = now / windowMillis; new window ? count = 0
+             |        +-- 2. count >= max ? return false
+             |        +-- 3. count++, return true
              |
              +-- Sliding Window Log
-             |        +-- drop timestamps older than (now - windowMillis)
-             |        +-- size < max ? record now, return true : return false
+             |        +-- 1. drop timestamps older than (now - windowMillis)
+             |        +-- 2. size >= max ? return false
+             |        +-- 3. record now, return true
              |
              +-- Sliding Window Counter
-             |        +-- roll bucket pointer if a window boundary was crossed
-             |        +-- estimate = currentCount + previousCount * overlapFraction
-             |        +-- estimate < max ? currentCount++, return true : return false
+             |        +-- 1. window = now / windowMillis; new window ? previous = current (or 0), current = 0
+             |        +-- 2. currentCount + previousCount * overlapFraction >= max ? return false
+             |        +-- 3. currentCount++, return true
              |
              +-- Token Bucket
-             |        +-- lazy refill: tokens += elapsed * refillRate (capped at capacity)
-             |        +-- tokens >= 1 ? consume 1, return true : return false
+             |        +-- 1. lazy refill: tokens += elapsed * refillRate (capped at capacity)
+             |        +-- 2. tokens < 1 ? return false
+             |        +-- 3. tokens--, return true
              |
              +-- Leaky Bucket
-                      +-- lazy leak: water -= elapsed * leakRate (floored at 0)
-                      +-- water + 1 <= capacity ? water++, return true : return false
+                      +-- 1. lazy leak: water -= elapsed * leakRate (floored at 0)
+                      +-- 2. water + 1 > capacity ? return false
+                      +-- 3. water++, return true
 ```
 
 ---
@@ -139,7 +143,7 @@ classDiagram
     class FixedWindowCounterStrategy {
         -maxRequests: int
         -windowMillis: long
-        -windowStart: long
+        -currentWindow: long
         -count: int
         +FixedWindowCounterStrategy(int, long)
         +allow() boolean «sync»
@@ -156,7 +160,7 @@ classDiagram
     class SlidingWindowCounterStrategy {
         -maxRequests: int
         -windowMillis: long
-        -currentBucket: long
+        -currentWindow: long
         -currentCount: int
         -previousCount: int
         +SlidingWindowCounterStrategy(int, long)
@@ -170,7 +174,6 @@ classDiagram
         -lastRefillNanos: long
         +TokenBucketStrategy(long, double)
         +allow() boolean «sync»
-        -refill()
     }
 
     class LeakyBucketStrategy {
@@ -180,7 +183,6 @@ classDiagram
         -lastLeakNanos: long
         +LeakyBucketStrategy(long, double)
         +allow() boolean «sync»
-        -leak()
     }
 
     FixedWindowCounterStrategy ..|> RateLimitStrategy
@@ -247,21 +249,32 @@ No clientId parameter (each instance is already bound to one client). No timesta
 
 **Interview power move**: *"The interface is `boolean allow()`. One method. Anything more would either leak algorithm-specific state or hand the clock to the caller — both are mistakes."*
 
+**The one skeleton every algorithm follows**: All five `allow()` bodies are the same three steps, so you only memorise ONE shape and swap the state:
+
+```
+allow():
+  now = clock()
+  1. catch up  -- bring state forward to `now` (roll window / evict old hits / refill / leak)
+  2. check     -- limit reached?  -> return false
+  3. consume   -- record this request -> return true
+```
+
+The pseudocode in Layers 5–9 uses exactly these three steps, in this order.
+
 ### Layer 5: Fixed Window Counter — the naive baseline (and the bug it leaves behind)
 
 **What**: Chop time into fixed `windowMillis` intervals. Each interval has one counter. Allow until the counter reaches `maxRequests`, then deny until the window rolls.
 
 ```
-state per client: (windowStart, count)
+state per client: (currentWindow, count)
 allow():
-  if (now - windowStart) >= windowMillis:
-      windowStart = aligned to multiples of windowMillis
-      count = 0
-  if count < max: count++; return true
-  else: return false
+  1. window = now / windowMillis
+     if window != currentWindow: currentWindow = window; count = 0
+  2. if count >= max: return false
+  3. count++; return true
 ```
 
-**Why we snap windowStart to multiples of `windowMillis` rather than to `now`**: Otherwise every client ends up on its own private window grid. Two clients hitting the limiter 30s apart would land on offset boundaries, which makes the algorithm's behaviour depend on first-call timing — not what anyone wants.
+**Why a window id (`now / windowMillis`) rather than a `windowStart` timestamp**: Integer division puts every request on the wall-clock grid (:00, :01, ...) and jumps straight past any number of idle windows — no "how many windows did we skip?" arithmetic. Every client shares the same grid, so the reset time is predictable (`Retry-After = (currentWindow + 1) * windowMillis - now`). And it is exactly the key you'd use in Redis (`client:<id>:<window>` + `INCR` + `EXPIRE`), so the in-memory answer scales straight into the distributed one. The simpler `windowStart = now` also works but starts each window at the first request after a gap, so windows drift off the clock grid.
 
 **The bug interviewers ALWAYS attack**: A client fires `maxRequests` at second 59.9 of window 1 (counter saturates and then rolls), then another `maxRequests` at second 0.1 of window 2 (fresh counter, restarts). Wall-clock view: `2 * maxRequests` in 0.2 seconds. Each fixed window saw only `maxRequests`, so the limiter says everything is fine. This is exactly what Sliding Window Log fixes.
 
@@ -274,10 +287,9 @@ allow():
 ```
 state per client: (hits: Deque<Long>)
 allow():
-  cutoff = now - windowMillis
-  while hits.peekFirst() <= cutoff: hits.pollFirst()
-  if hits.size() < max: hits.offerLast(now); return true
-  else: return false
+  1. while hits.peekFirst() <= now - windowMillis: hits.pollFirst()
+  2. if hits.size() >= max: return false
+  3. hits.offerLast(now); return true
 ```
 
 **Why this fixes the boundary bug**: The window's reference frame is "now", not a wall-clock boundary. At second 59.5 the window covers seconds 58.5 to 59.5; at second 0.5 it covers seconds 59.5 to 0.5 — and any over-limit traffic gets dropped because the older hits are still inside the rolling window. There is no boundary for the attacker to align with.
@@ -294,18 +306,18 @@ allow():
 
 ### Layer 7: Sliding Window Counter — the production hybrid
 
-**What**: Keep TWO counters — the current fixed-window bucket and the previous one — plus a weighted blend.
+**What**: Fixed Window plus ONE extra counter — keep the current window's count AND the previous window's, then weighted-blend them.
 
 ```
-state per client: (currentBucket, currentCount, previousCount)
+state per client: (currentWindow, currentCount, previousCount)
 allow():
-  bucket = now / windowMillis
-  if bucket > currentBucket: roll (previousCount = currentCount, currentCount = 0, ...)
-  elapsedInCurrent = now - currentBucket * windowMillis
-  overlap = 1 - elapsedInCurrent / windowMillis
-  estimate = currentCount + previousCount * overlap
-  if estimate < max: currentCount++; return true
-  else: return false
+  1. window = now / windowMillis                      -- same window id as Fixed Window
+     if window != currentWindow:
+         previousCount = (window == currentWindow + 1) ? currentCount : 0
+         currentCount = 0; currentWindow = window
+  2. overlap = 1 - (now % windowMillis) / windowMillis
+     if currentCount + previousCount * overlap >= max: return false
+  3. currentCount++; return true
 ```
 
 **The intuition**: Assume the previous window's traffic was spread uniformly. So `overlap`'s worth of it "still counts" toward the rolling window — exactly the linear interpolation you'd draw on a whiteboard.
@@ -323,11 +335,9 @@ allow():
 ```
 state per client: (tokens: double, lastRefillNanos: long)
 allow():
-  elapsed = now - lastRefillNanos
-  tokens = min(capacity, tokens + elapsed * rate)
-  lastRefillNanos = now
-  if tokens >= 1: tokens -= 1; return true
-  else: return false
+  1. tokens = min(capacity, tokens + (now - lastRefillNanos) * rate); lastRefillNanos = now
+  2. if tokens < 1: return false
+  3. tokens -= 1; return true
 ```
 
 **The lazy-refill trick**: We do NOT spawn a background thread to top up tokens. On every `allow()` we compute "how many tokens *would* have arrived since the last call" and add them in one shot. Same math, zero scheduling overhead.
@@ -347,11 +357,9 @@ allow():
 ```
 state per client: (water: double, lastLeakNanos: long)
 allow():
-  elapsed = now - lastLeakNanos
-  water = max(0, water - elapsed * leakRate)
-  lastLeakNanos = now
-  if water + 1 <= capacity: water += 1; return true
-  else: return false
+  1. water = max(0, water - (now - lastLeakNanos) * leakRate); lastLeakNanos = now
+  2. if water + 1 > capacity: return false
+  3. water += 1; return true
 ```
 
 **Honest comparison with Token Bucket**: The counter form of leaky bucket and token bucket are **mathematically equivalent** — same compare, same outcome, just flipped bookkeeping. The interviewer is testing whether you can articulate the *intent* difference:
@@ -484,7 +492,7 @@ rate-limiter/
 | Dimension | Fixed Window | Sliding Window Log | Sliding Window Counter | Token Bucket | Leaky Bucket |
 |-----------|--------------|--------------------|------------------------|--------------|--------------|
 | **Allows bursts?** | Up to `maxRequests` per window (boundary leak: 2x possible) | No — exactly `maxRequests` per rolling window | Approx — within ~0.003% | Yes, up to `capacity` | Up to `capacity` (counter form) / smoothed to `leakRate` (queue form) |
-| **Memory per client** | O(1) — counter + windowStart | O(maxRequests) — one timestamp per hit | O(1) — two ints + a long | O(1) — two numbers | O(1) — two numbers |
+| **Memory per client** | O(1) — counter + window id | O(maxRequests) — one timestamp per hit | O(1) — two ints + a long | O(1) — two numbers | O(1) — two numbers |
 | **CPU per call** | O(1) | O(1) amortized | O(1) | O(1) | O(1) |
 | **Accuracy** | Loose (boundary burst) | Exact | ~0.003% error | Exact within model | Exact within model |
 | **Clock source** | `currentTimeMillis` | `currentTimeMillis` | `currentTimeMillis` | `nanoTime` (monotonic deltas) | `nanoTime` (monotonic deltas) |
@@ -555,11 +563,11 @@ You could, and it would even work — the lambda passed to `compute` runs under 
 
 ### Q14. Why is each strategy's `allow()` declared `synchronized`?
 
-Because every strategy's body is a **read-modify-write** on its own mutable state, and the read, the modify, and the write must be one indivisible step. In `TokenBucketStrategy` it's `refill()` then read `tokens`, check `>= 1.0`, decrement — in `FixedWindowCounterStrategy` it's roll-`windowStart`-and-reset-`count`, check `count < maxRequests`, then `count++` — in `SlidingWindowLogStrategy` it's evict-stale-from-`hitTimestamps` then size-check then append. Without the lock, two requests for the same client interleave: both see the last slot free and both take it. That's the **lost-update / over-admit race** — the limiter admits past its own limit, which is the one bug that makes a rate limiter pointless. One lock around the whole sequence closes it.
+Because every strategy's body is a **read-modify-write** on its own mutable state, and the read, the modify, and the write must be one indivisible step. In `TokenBucketStrategy` it's refill `tokens`, check `< 1.0`, decrement — in `FixedWindowCounterStrategy` it's roll-`currentWindow`-and-reset-`count`, check `count >= maxRequests`, then `count++` — in `SlidingWindowLogStrategy` it's evict-stale-from-`hitTimestamps` then size-check then append. Without the lock, two requests for the same client interleave: both see the last slot free and both take it. That's the **lost-update / over-admit race** — the limiter admits past its own limit, which is the one bug that makes a rate limiter pointless. One lock around the whole sequence closes it.
 
 ### Q15. Why isn't a single `AtomicLong` count enough instead of `synchronized`?
 
-Because refill (or window-roll, or eviction) and consume must move **together**, and an `AtomicLong` only makes *one* operation atomic. In `TokenBucketStrategy`, `refill()` computes elapsed nanos and adds tokens, then `allow()` checks and decrements — that's at least two dependent steps reading and writing `tokens` *and* `lastRefillNanos`. An `AtomicLong` could make the single decrement atomic, but two threads could still both refill-then-take past `capacity` because nothing keeps the refill+consume pair indivisible. A CAS loop could in principle bundle it, but it would have to atomically update two fields (`tokens` + `lastRefillNanos`) at once — that needs an `AtomicReference` to a snapshot object plus retry logic, far more code than one `synchronized`.
+Because refill (or window-roll, or eviction) and consume must move **together**, and an `AtomicLong` only makes *one* operation atomic. In `TokenBucketStrategy`, `allow()` computes elapsed nanos and adds tokens, then checks and decrements — that's at least two dependent steps reading and writing `tokens` *and* `lastRefillNanos`. An `AtomicLong` could make the single decrement atomic, but two threads could still both refill-then-take past `capacity` because nothing keeps the refill+consume pair indivisible. A CAS loop could in principle bundle it, but it would have to atomically update two fields (`tokens` + `lastRefillNanos`) at once — that needs an `AtomicReference` to a snapshot object plus retry logic, far more code than one `synchronized`.
 
 ### Q16. Why `ConcurrentHashMap` for `perClient` and not a `HashMap` or `Collections.synchronizedMap`?
 

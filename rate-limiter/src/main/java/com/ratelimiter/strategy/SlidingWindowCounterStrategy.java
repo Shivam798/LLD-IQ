@@ -51,11 +51,12 @@ public class SlidingWindowCounterStrategy implements RateLimitStrategy {
     private final int maxRequests;
     private final long windowMillis;
 
-    // Which fixed-window bucket are we currently inside? Computed as
-    // `now / windowMillis`. Because Long division truncates, two calls
-    // inside the same window get the same bucket id -- which is exactly
-    // what we want for cheap "did we cross a boundary?" checks.
-    private long currentBucket;
+    // Which window are we currently inside? Computed as
+    // `now / windowMillis` -- the exact same window id that
+    // FixedWindowCounterStrategy uses. Because long division truncates,
+    // two calls inside the same window get the same id -- which is
+    // exactly what we want for cheap "did we cross a boundary?" checks.
+    private long currentWindow;
     private int currentCount;
     private int previousCount;
 
@@ -68,49 +69,44 @@ public class SlidingWindowCounterStrategy implements RateLimitStrategy {
         }
         this.maxRequests = maxRequests;
         this.windowMillis = windowMillis;
-        this.currentBucket = System.currentTimeMillis() / windowMillis;
+        this.currentWindow = System.currentTimeMillis() / windowMillis;
         this.currentCount = 0;
         this.previousCount = 0;
     }
 
     /**
-     * Synchronized because the bucket-roll logic and the count update
+     * Synchronized because the window-roll logic and the count update
      * must be atomic. Without the lock two threads at a window boundary
-     * could each independently roll the bucket, doubling the reset.
+     * could each independently roll the window, doubling the reset.
      */
     @Override
     public synchronized boolean allow() {
         long now = System.currentTimeMillis();
-        long bucket = now / windowMillis;
 
-        // Step 1: catch up the bucket pointer if we have crossed a
-        // window boundary since the last call.
-        if (bucket == currentBucket + 1) {
-            // Advanced exactly one window: current becomes previous.
-            previousCount = currentCount;
+        // Step 1: catch up -- crossed into a new window? Same check as
+        // Fixed Window, plus one extra line: if we moved exactly one
+        // window, current becomes previous; if we skipped two or more
+        // (idle client), both are stale and there is no "previous".
+        long window = now / windowMillis;
+        if (window != currentWindow) {
+            previousCount = (window == currentWindow + 1) ? currentCount : 0;
             currentCount = 0;
-            currentBucket = bucket;
-        } else if (bucket > currentBucket + 1) {
-            // Skipped two or more windows (idle client). Both buckets
-            // are now stale -- there is no "previous" anymore.
-            previousCount = 0;
-            currentCount = 0;
-            currentBucket = bucket;
+            currentWindow = window;
         }
 
-        // Step 2: compute the rolling estimate.
+        // Step 2: check -- is the rolling estimate already at the limit?
         //
-        // We never stored individual timestamps -- we only have two bucket
+        // We never stored individual timestamps -- we only have two window
         // counts. To answer "how many requests in the last windowMillis?"
         // we LINEARLY INTERPOLATE between them, assuming the previous
         // window's hits were spread uniformly across it.
 
         // (a) How far are we into the current window?
-        // currentBucket * windowMillis = start time of the current window;
+        // currentWindow * windowMillis = start time of the current window;
         // subtracting from `now` gives ms consumed inside the current window.
-        // e.g. windowMillis = 60_000, currentBucket = 100, now is 18s into
-        // that bucket  ->  elapsedInCurrent = 18_000.
-        long elapsedInCurrent = now - currentBucket * windowMillis;
+        // e.g. windowMillis = 60_000, currentWindow = 100, now is 18s into
+        // that window  ->  elapsedInCurrent = 18_000.
+        long elapsedInCurrent = now - currentWindow * windowMillis;
 
         // (b) Fraction of the PREVIOUS window still in the rolling view
         //     [now - windowMillis, now].
@@ -138,7 +134,7 @@ public class SlidingWindowCounterStrategy implements RateLimitStrategy {
         //                    of its hits are in view.
         //
         // This is what makes the limit "slide" instead of resetting cliff-style at
-        // the bucket boundary -- the previous window's contribution decays smoothly
+        // the window boundary -- the previous window's contribution decays smoothly
         // toward zero as the current window fills. That decay is exactly what kills
         // the Fixed Window boundary-burst bug.
         //
@@ -146,12 +142,12 @@ public class SlidingWindowCounterStrategy implements RateLimitStrategy {
         //   currentCount = 20, previousCount = 80, overlap = 0.70
         //   estimate = 20 + 80 * 0.70 = 76  -> under limit, allow.
         double estimate = currentCount + previousCount * overlapFraction;
-
-        // Step 3: allow or deny based on the blended count.
-        if (estimate < maxRequests) {
-            currentCount++;
-            return true;
+        if (estimate >= maxRequests) {
+            return false;
         }
-        return false;
+
+        // Step 3: consume -- record this request.
+        currentCount++;
+        return true;
     }
 }

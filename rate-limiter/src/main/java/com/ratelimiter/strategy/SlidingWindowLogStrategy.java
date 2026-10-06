@@ -81,7 +81,7 @@ public class SlidingWindowLogStrategy implements RateLimitStrategy {
         long now = System.currentTimeMillis();
         long cutoff = now - windowMillis;
 
-        // Step 1: slide the window forward by dropping timestamps that
+        // Step 1: catch up -- slide the window forward by dropping timestamps that
         // are now older than the cutoff. The deque is naturally ordered
         // by time (we only ever append `now`, which monotonically
         // increases), so we can stop the moment we see a fresh enough
@@ -90,12 +90,12 @@ public class SlidingWindowLogStrategy implements RateLimitStrategy {
             hitTimestamps.pollFirst();
         }
 
-        // Step 2: capacity check on the remaining entries.
+        // Step 2: check -- are the remaining entries already at the limit?
         if (hitTimestamps.size() >= maxRequests) {
             return false;
         }
 
-        // Step 3: record this hit at the tail and allow.
+        // Step 3: consume -- record this hit at the tail.
         hitTimestamps.offerLast(now);
         return true;
     }

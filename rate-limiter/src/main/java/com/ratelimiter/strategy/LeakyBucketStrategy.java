@@ -102,28 +102,23 @@ public class LeakyBucketStrategy implements RateLimitStrategy {
      */
     @Override
     public synchronized boolean allow() {
-        leak();
-        if (water + 1.0 <= capacity) {
-            water += 1.0;
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * Drain the bucket by however much would have leaked since the
-     * last call, floored at zero. Lazy leak: no background thread,
-     * just compute on demand -- same trick as TokenBucketStrategy's
-     * refill.
-     */
-    private void leak() {
         long now = System.nanoTime();
-        long elapsedNanos = now - lastLeakNanos;
-        if (elapsedNanos <= 0) {
-            return;
-        }
-        double leaked = (elapsedNanos / 1_000_000_000.0) * leakRatePerSecond;
+
+        // Step 1: catch up -- drain by however much would have leaked
+        // since the last call, floored at zero. Lazy leak: no background
+        // thread, just compute on demand -- the mirror image of
+        // TokenBucketStrategy's refill.
+        double leaked = (now - lastLeakNanos) / 1_000_000_000.0 * leakRatePerSecond;
         water = Math.max(0.0, water - leaked);
         lastLeakNanos = now;
+
+        // Step 2: check -- no room for one more unit of water?
+        if (water + 1.0 > capacity) {
+            return false;
+        }
+
+        // Step 3: consume -- pour this request into the bucket.
+        water += 1.0;
+        return true;
     }
 }

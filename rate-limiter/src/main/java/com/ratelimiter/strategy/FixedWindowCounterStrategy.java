@@ -39,13 +39,14 @@ public class FixedWindowCounterStrategy implements RateLimitStrategy {
     private final int maxRequests;
     private final long windowMillis;
 
-    // Start time of the CURRENT window. Whenever `now - windowStart`
-    // crosses `windowMillis`, we roll: counter back to zero and the
-    // window start advances. We deliberately advance by exact multiples
-    // of windowMillis (rather than to `now`) so that long gaps don't
-    // shift the boundaries -- otherwise two clients hitting the limiter
-    // 30s apart would silently end up on different window grids.
-    private long windowStart;
+    // Which window are we currently inside? Computed as
+    // `now / windowMillis`, so every call inside the same window gets
+    // the same id and the windows sit on the wall-clock grid (:00, :01,
+    // ...) for EVERY client -- the same id you would use as the Redis key
+    // (`client:<id>:<window>` + INCR + EXPIRE) in a distributed version.
+    // Integer division also jumps straight past any number of idle
+    // windows, so no "how many windows did we skip?" arithmetic.
+    private long currentWindow;
     private int count;
 
     public FixedWindowCounterStrategy(int maxRequests, long windowMillis) {
@@ -57,13 +58,13 @@ public class FixedWindowCounterStrategy implements RateLimitStrategy {
         }
         this.maxRequests = maxRequests;
         this.windowMillis = windowMillis;
-        this.windowStart = System.currentTimeMillis();
+        this.currentWindow = System.currentTimeMillis() / windowMillis;
         this.count = 0;
     }
 
     /**
      * Synchronized because the body is a read-modify-write on the
-     * (windowStart, count) pair. Without the lock two threads at a
+     * (currentWindow, count) pair. Without the lock two threads at a
      * window boundary could both decide "still in old window, counter
      * == max, deny" while the actual state has already rolled -- or
      * worse, both roll and both reset the counter.
@@ -71,21 +72,21 @@ public class FixedWindowCounterStrategy implements RateLimitStrategy {
     @Override
     public synchronized boolean allow() {
         long now = System.currentTimeMillis();
-        long elapsed = now - windowStart;
 
-        if (elapsed >= windowMillis) {
-            // The window has rolled at least once. Snap forward by full
-            // window multiples so the grid stays aligned and the new
-            // window starts with a fresh counter.
-            long windowsToSkip = elapsed / windowMillis;
-            windowStart += windowsToSkip * windowMillis;
+        // Step 1: catch up -- crossed into a new window? Fresh counter.
+        long window = now / windowMillis;
+        if (window != currentWindow) {
+            currentWindow = window;
             count = 0;
         }
 
-        if (count < maxRequests) {
-            count++;
-            return true;
+        // Step 2: check -- window already full?
+        if (count >= maxRequests) {
+            return false;
         }
-        return false;
+
+        // Step 3: consume -- record this request.
+        count++;
+        return true;
     }
 }

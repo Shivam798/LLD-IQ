@@ -70,33 +70,27 @@ public class TokenBucketStrategy implements RateLimitStrategy {
      */
     @Override
     public synchronized boolean allow() {
-        refill();
-        if (tokens >= 1.0) {
-            tokens -= 1.0;
-            return true;
-        }
-        return false;
-    }
-
-    /**
-     * Top up the bucket by however many tokens have accrued since the
-     * last refill, capped at `capacity`.
-     *
-     * The cap is what makes token bucket different from leaky bucket: if
-     * a client goes quiet for hours, the bucket does NOT grow unbounded
-     * and let them dump a million requests at once. It saturates at
-     * `capacity` -- the maximum burst they're allowed.
-     */
-    private void refill() {
         long now = System.nanoTime();
-        long elapsedNanos = now - lastRefillNanos;
-        if (elapsedNanos <= 0) {
-            // Clock didn't move (or we're being called inside the same
-            // nanosecond). No tokens to add.
-            return;
-        }
-        double tokensToAdd = (elapsedNanos / 1_000_000_000.0) * refillRatePerSecond;
+
+        // Step 1: catch up -- top up by however many tokens have accrued
+        // since the last call, capped at `capacity`. Lazy refill: no
+        // background thread, just compute on demand.
+        //
+        // The cap is what makes token bucket different from leaky bucket: if
+        // a client goes quiet for hours, the bucket does NOT grow unbounded
+        // and let them dump a million requests at once. It saturates at
+        // `capacity` -- the maximum burst they're allowed.
+        double tokensToAdd = (now - lastRefillNanos) / 1_000_000_000.0 * refillRatePerSecond;
         tokens = Math.min(capacity, tokens + tokensToAdd);
         lastRefillNanos = now;
+
+        // Step 2: check -- no whole token left?
+        if (tokens < 1.0) {
+            return false;
+        }
+
+        // Step 3: consume -- spend one token.
+        tokens -= 1.0;
+        return true;
     }
 }

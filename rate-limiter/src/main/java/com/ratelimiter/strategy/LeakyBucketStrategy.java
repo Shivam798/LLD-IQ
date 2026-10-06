@@ -108,8 +108,8 @@ public class LeakyBucketStrategy implements RateLimitStrategy {
         // since the last call, floored at zero. Lazy leak: no background
         // thread, just compute on demand -- the mirror image of
         // TokenBucketStrategy's refill.
-        double leaked = (now - lastLeakNanos) / 1_000_000_000.0 * leakRatePerSecond;
-        water = Math.max(0.0, water - leaked);
+        double elapsedSeconds = (now - lastLeakNanos) / 1_000_000_000.0;
+        water = Math.max(0.0, water - elapsedSeconds * leakRatePerSecond);
         lastLeakNanos = now;
 
         // Step 2: check -- no room for one more unit of water?

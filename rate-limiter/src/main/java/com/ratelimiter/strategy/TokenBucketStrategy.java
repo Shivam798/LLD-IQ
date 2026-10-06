@@ -7,14 +7,16 @@ package com.ratelimiter.strategy;
  * rate of `refillRatePerSecond` tokens per second. Every request consumes
  * one token; if no token is available, the request is denied.
  *
- *      tokens
- *        |
- *  capacity +-----------+--------+--------+
- *        |   /\        |  /\    | /\
- *        |  /  \  /\   | /  \   |/  \      <-- bursts drain the bucket
- *        | /    \/  \  |/    \  /    \
- *        |/          \/        \/      \
- *        +-------------------------------> time
+ *                     refillRatePerSecond
+ *                             |
+ *                             v
+ *                          +-----+
+ *                          | o o |   <- tokens (starts full, never
+ *                          | o o |      exceeds `capacity`)
+ *                          +--+--+
+ *                             |
+ *                             v
+ *                  each request takes one token
  *
  * Why token bucket is a favourite in interviews:
  *  - Allows BURSTS up to `capacity` (unlike leaky bucket which strictly
@@ -40,10 +42,10 @@ public class TokenBucketStrategy implements RateLimitStrategy {
     // call. With longs we'd round down to 0 each time and lose the rate.
     private double tokens;
 
-    // Nanos rather than millis to keep refill math accurate even when
-    // calls are microseconds apart. System.nanoTime is monotonic so it
-    // cannot go backwards on NTP adjustments -- important for any time-
-    // based limiter.
+    // nanoTime, not currentTimeMillis: we only need ELAPSED time, and
+    // nanoTime is monotonic -- it cannot go backwards on NTP adjustments.
+    // A wall-clock jump back would make elapsed negative and silently
+    // remove tokens.
     private long lastRefillNanos;
 
     public TokenBucketStrategy(long capacity, double refillRatePerSecond) {
@@ -72,16 +74,11 @@ public class TokenBucketStrategy implements RateLimitStrategy {
     public synchronized boolean allow() {
         long now = System.nanoTime();
 
-        // Step 1: catch up -- top up by however many tokens have accrued
-        // since the last call, capped at `capacity`. Lazy refill: no
-        // background thread, just compute on demand.
-        //
-        // The cap is what makes token bucket different from leaky bucket: if
-        // a client goes quiet for hours, the bucket does NOT grow unbounded
-        // and let them dump a million requests at once. It saturates at
-        // `capacity` -- the maximum burst they're allowed.
-        double tokensToAdd = (now - lastRefillNanos) / 1_000_000_000.0 * refillRatePerSecond;
-        tokens = Math.min(capacity, tokens + tokensToAdd);
+        // Step 1: catch up -- lazy refill for the time since the last
+        // call. The cap matters: a client idle for hours gets at most
+        // `capacity` tokens back, not a million.
+        double elapsedSeconds = (now - lastRefillNanos) / 1_000_000_000.0;
+        tokens = Math.min(capacity, tokens + elapsedSeconds * refillRatePerSecond);
         lastRefillNanos = now;
 
         // Step 2: check -- no whole token left?

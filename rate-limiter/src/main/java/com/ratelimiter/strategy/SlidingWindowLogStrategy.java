@@ -79,13 +79,13 @@ public class SlidingWindowLogStrategy implements RateLimitStrategy {
     @Override
     public synchronized boolean allow() {
         long now = System.currentTimeMillis();
-        long cutoff = now - windowMillis;
 
-        // Step 1: catch up -- slide the window forward by dropping timestamps that
-        // are now older than the cutoff. The deque is naturally ordered
+        // Step 1: catch up -- slide the window forward by dropping
+        // timestamps older than the cutoff. The deque is naturally ordered
         // by time (we only ever append `now`, which monotonically
         // increases), so we can stop the moment we see a fresh enough
         // entry -- no scan of the whole deque.
+        long cutoff = now - windowMillis;
         while (!hitTimestamps.isEmpty() && hitTimestamps.peekFirst() <= cutoff) {
             hitTimestamps.pollFirst();
         }

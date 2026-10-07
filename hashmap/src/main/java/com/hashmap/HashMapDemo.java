@@ -2,6 +2,7 @@ package com.hashmap;
 
 import com.hashmap.model.MyConcurrentHashMap;
 import com.hashmap.model.MyHashMap;
+import com.hashmap.model.MyResizableHashMap;
 
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -19,6 +20,7 @@ public class HashMapDemo {
         removeFromAnywhereInTheChain();
         theRace();
         putIfAbsentIsAtomic();
+        itGrows();
     }
 
     // 1 -------------------------------------------------------------------
@@ -155,6 +157,47 @@ public class HashMapDemo {
         System.out.println("    if (map.get(k) == -1) map.put(k, v);");
         System.out.println("both threads pass the check before either writes. Each call is atomic;");
         System.out.println("the pair is not.");
+    }
+
+    // 7 -------------------------------------------------------------------
+
+    private static void itGrows() {
+        header("7. MyResizableHashMap -- generic, and the table grows");
+
+        MyResizableHashMap<Integer, Integer> map = new MyResizableHashMap<>();
+        System.out.println("starts at capacity " + map.capacity() + ", load factor 0.75 -> resizes past 12 entries");
+        int lastCapacity = map.capacity();
+        for (int k = 1; k <= 100_000; k++) {
+            map.put(k, k * 10);
+            if (map.capacity() != lastCapacity) {
+                if (map.capacity() <= 256) {
+                    System.out.printf("  put #%-6d size %-6d capacity %d -> %d%n", k, map.size(), lastCapacity, map.capacity());
+                }
+                lastCapacity = map.capacity();
+            }
+        }
+        System.out.println("  ... and so on");
+
+        int found = 0;
+        for (int k = 1; k <= 100_000; k++) {
+            if (map.get(k) == k * 10) found++;
+        }
+        System.out.printf("after 100,000 puts: size %d, capacity %d, found %d of 100000 after every resize%n",
+                map.size(), map.capacity(), found);
+        System.out.printf("entries per bucket = %.2f -- never above 0.75, so chains stay O(1)%n",
+                (double) map.size() / map.capacity());
+
+        System.out.println();
+        map.put(-7, 70);
+        System.out.println("negative key: get(-7) = " + map.get(-7) + "   (Math.abs keeps the index >= 0)");
+
+        MyResizableHashMap<String, String> names = new MyResizableHashMap<>();
+        names.put("alice", "admin");
+        names.put("alice", "owner");
+        System.out.println("String key: get(\"alice\") = " + names.get("alice") + "   (overwritten, size " + names.size() + ")");
+        System.out.println("missing:    get(\"bob\")   = " + names.get("bob") + "    (null, not -1)");
+        names.remove("alice");
+        System.out.println("removed:    get(\"alice\") = " + names.get("alice") + ", size " + names.size());
     }
 
     // helpers --------------------------------------------------------------

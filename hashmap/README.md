@@ -1,6 +1,7 @@
 # HashMap — Low Level Design
 
-Design a HashMap from scratch (LeetCode 706), then make it thread-safe by changing three things.
+Design a HashMap from scratch (LeetCode 706), grow it into a generic map that resizes, then make it
+thread-safe by changing three things.
 
 ## Problem Statement
 
@@ -18,9 +19,14 @@ class MyHashMap {
 - `put` on a key that already exists **overwrites**, it does not add a second copy
 - Constraints: `0 <= key <= 10⁶`, `0 <= value <= 10⁶`, up to 10⁴ calls
 
-**Follow-up (usually the second half of the round):** what breaks with two threads, and how you fix it.
+**Follow-up 1 (the LLD-round framing):** drop the call limit and the `int` keys. Make it
+`MyResizableHashMap<K, V>` — any key type via `hashCode` / `equals`, `null` for "absent", and a table
+that doubles once it is 75% full so operations stay O(1) however many entries arrive. In an LLD round
+this is usually where the interviewer *expects* you to end up; the fixed-size version is the opener.
 
-**Not asked for:** generics, resizing, iterators, tree bins, the `java.util.Map` interface.
+**Follow-up 2 (usually the second half of the round):** what breaks with two threads, and how you fix it.
+
+**Not asked for:** iterators, tree bins, shrinking, the `java.util.Map` interface.
 Knowing where the question stops is part of answering it.
 
 ## High-Level Flow
@@ -45,7 +51,27 @@ put(key, value)                     get(key)                  remove(key)
                                                         table[i] = dummy.next
 ```
 
-The whole design is those three pictures. Everything below explains why each one looks like that.
+`MyResizableHashMap.put` is the same picture with one step bolted on the end:
+
+```
+put(key, value)
+      |
+      v
+ i = |key.hashCode() % capacity|
+ walk chain at table[i] -- key found? -- yes --> overwrite, return   (size unchanged, so never resizes)
+      |
+      no
+      v
+ prepend a new node, size++
+      |
+      v
+ size > capacity * 0.75 ?
+      |
+      yes --> resize(): new table of 2 x capacity, size = 0,
+              put() every old entry again
+```
+
+The whole design is those pictures. Everything below explains why each one looks like that.
 
 ## Class Diagram
 
@@ -94,6 +120,27 @@ classDiagram
         ~volatile CNode next
     }
 
+    class MyResizableHashMap~K,V~ {
+        -int INITIAL_CAPACITY$ = 16
+        -double LOAD_FACTOR$ = 0.75
+        -RNode~K,V~[] table
+        -int size
+        +put(K key, V value) void
+        +get(K key) V
+        +remove(K key) void
+        +size() int
+        +capacity() int
+        -resize() void
+        -index(K key) int
+    }
+
+    class RNode~K,V~ {
+        <<static nested>>
+        ~K key
+        ~V value
+        ~RNode next
+    }
+
     class HashMapDemo {
         +main(String[] args)$ void
     }
@@ -102,8 +149,11 @@ classDiagram
     Node --> "0..1" Node : next
     MyConcurrentHashMap *-- "0..*" CNode : owns
     CNode --> "0..1" CNode : volatile next
+    MyResizableHashMap *-- "0..*" RNode : owns
+    RNode --> "0..1" RNode : next
     HashMapDemo ..> MyHashMap : races it, and it breaks
     HashMapDemo ..> MyConcurrentHashMap : races it, and it holds
+    HashMapDemo ..> MyResizableHashMap : grows it to 100k, finds every entry
 ```
 
 </details>
@@ -198,14 +248,53 @@ needs `h ^ (h >>> 16)` first to mix the high bits down. Two valid designs:
 With 10⁴ calls over 769 buckets the expected chain is ~13, so all three ops are O(1) average and
 O(n) worst case — every key congruent mod 769.
 
-### Layer 7: If they ask you to grow it
+### Layer 7: Grow it — `MyResizableHashMap<K, V>`
 
-We do not resize; the call limit makes it unnecessary. Say what you would do:
+769 fixed buckets is fine *only* because of the 10⁴-call limit. In an LLD round there is no limit:
+put a million entries in and every chain is ~1,300 long, so "O(1) average" quietly became O(n / 769).
+O(1) average is a promise about **entries per bucket**, and you can only keep it by growing the table.
 
-Track `size`, and when `size > buckets * 0.75`, double the array and re-place every entry. That
-0.75 is the space/time knob — lower wastes empty slots, higher lengthens chains. And mention the
-trick the JDK gets from powers of two: after doubling, an entry's new index is either the same `j`
-or `j + oldCapacity`, decided by one bit test, so a resize never re-hashes a key.
+It is `MyHashMap` with three changes — nothing else moves:
+
+| | `MyHashMap` | `MyResizableHashMap<K, V>` |
+|---|---|---|
+| keys | `int`, compared with `==` | any `K`: bucket from `hashCode()`, match with `equals()` |
+| table | 769 buckets forever | starts at 16, **doubles** once `size > capacity * 0.75` |
+| "absent" | `-1` (safe only because values are pinned ≥ 0) | `null` |
+
+The growth is one check at the end of `put` and one short method:
+
+```java
+size++;
+if (size > table.length * LOAD_FACTOR) resize();   // 13th entry into 16 buckets -> 32
+
+private void resize() {
+    Node<K, V>[] old = table;
+    table = new Node[old.length * 2];
+    size = 0;                                       // put() counts them back up
+    for (Node<K, V> head : old)
+        for (Node<K, V> cur = head; cur != null; cur = cur.next)
+            put(cur.key, cur.value);
+}
+```
+
+**Why every entry has to move:** the index is `key.hashCode() % capacity` — it depends on the capacity.
+Double the capacity and the same key can land in a different bucket. Leave it where it was and `get`
+looks in the new bucket and never finds it. Re-`put`ting everything is the simplest way to re-place them.
+
+**Why 0.75:** it's the space/time knob. Lower wastes empty buckets; higher lengthens chains. 0.75 is the
+JDK default.
+
+**Why double, and why that keeps `put` O(1):** a resize is O(n) — every entry moves. But doubling means
+the next resize is n puts away, so the total work over n puts is n + n/2 + n/4 + … < 2n. Each put pays
+a constant share: **amortized O(1)**. Growing by a fixed +16 instead would make it O(n) per put.
+
+**Why `Math.abs`:** `hashCode()` can be negative, and `%` keeps the sign — `-7 % 16` is `-7`, not a valid
+index. `MyHashMap` never needed this because its keys were pinned ≥ 0.
+
+**What the JDK does on top (say it, don't write it):** it caches each key's hash on the node so a
+resize never calls `hashCode()` again, keeps the capacity a power of two so the index is a fast
+bitmask `hash & (n - 1)`, and relinks the existing nodes instead of re-putting them.
 
 ### Layer 8: Two threads — three changes, and that is genuinely all
 
@@ -290,8 +379,11 @@ That is why `putIfAbsent` has to live *inside* the map, and why `computeIfAbsent
 > `table[i] = dummy.next`, because the node I removed may have *been* the head. With 10⁴ calls over
 > 769 buckets the expected chain is about 13, so all three ops are O(1) average and O(n) worst case.
 > Returning `-1` for a missing key is only safe because the problem pins values non-negative — real
-> maps return null and offer `containsKey`, which is the same ambiguity. If you wanted growth I'd
-> track size and double at a 0.75 load factor. For two threads, this map loses entries — two threads
+> maps return null and offer `containsKey`, which is the same ambiguity. Without the call limit I make
+> it `MyResizableHashMap<K, V>`: the bucket comes from `hashCode`, a match is `equals`, `null` means
+> absent, and I track size — once it passes 0.75 of the capacity I double the table and put every entry
+> back in, because the index depends on the capacity. A resize is O(n), but doubling makes `put`
+> amortized O(1). For two threads, this map loses entries — two threads
 > prepending to one bucket both read the old head and one write erases the other. The fix is three
 > changes to this exact code: any counter becomes an `AtomicInteger`, because `size++` is read-add-
 > write; claiming an *empty* bucket becomes a `compareAndSet`, so there's no lock at all and the
@@ -312,17 +404,19 @@ hashmap/
 ├── README.md
 ├── class-diagram.excalidraw
 └── src/main/java/com/hashmap/
-    ├── HashMapDemo.java                # Entry point — 6 sections, incl. the race run live
+    ├── HashMapDemo.java                # Entry point — 7 sections, incl. the race run live
     └── model/
-        ├── MyHashMap.java              # ★ 65 lines. The one you write on the board.
-        └── MyConcurrentHashMap.java    # The same map + the three changes
+        ├── MyHashMap.java              # ★ 65 lines. The one you write on the board first.
+        ├── MyResizableHashMap.java     # ★ The LLD-round version: <K, V> + resize at 0.75
+        └── MyConcurrentHashMap.java    # MyHashMap + the three thread-safety changes
 ```
 
 | File | What's in it |
 |---|---|
 | `MyHashMap` | `put` / `get` / `remove`, `hash`, nested `Node`. Fixed 769 buckets, separate chaining, prepend on insert, dummy node in `remove`. |
+| `MyResizableHashMap<K, V>` | `MyHashMap` plus generic keys (`hashCode` / `equals`), a `size` counter, and `resize()` doubling the table past 0.75 by re-putting every entry. `null` for absent. |
 | `MyConcurrentHashMap` | `AtomicReferenceArray` table, `AtomicInteger` size, CAS on empty buckets, `synchronized (head)` with the stale-head re-check, lock-free `get`, `putIfAbsent`. |
-| `HashMapDemo` | The stated API; 4 keys colliding in one bucket; overwrite not duplicating; removal from head/middle/tail/absent; 8 threads losing entries on `MyHashMap` and none on the concurrent one; 16 threads racing `putIfAbsent` with exactly one winner. |
+| `HashMapDemo` | The stated API; 4 keys colliding in one bucket; overwrite not duplicating; removal from head/middle/tail/absent; 8 threads losing entries on `MyHashMap` and none on the concurrent one; 16 threads racing `putIfAbsent` with exactly one winner; `MyResizableHashMap` resizing at the 13th put and holding all 100,000 entries, plus negative and `String` keys. |
 
 ## Design Patterns Used
 
@@ -342,7 +436,7 @@ This is a data-structure question, so it is thin on Gang-of-Four patterns on pur
 | **SRP** | `hash` decides the bucket, `Node` holds one entry and its link, `put`/`get`/`remove` sequence them. Changing the hash touches one method |
 | **OCP** | `BUCKETS` is a named constant and the hash lives in one place — changing either touches no call site |
 | **LSP** | Not exercised, deliberately: there is no inheritance. `MyConcurrentHashMap` is a separate class rather than a "thread-safe subclass", because a subclass adding `synchronized` to overrides leaks — internal self-calls in the parent bypass the lock |
-| **ISP** | The public surface is exactly the three methods asked for. No `entrySet`, no `keySet`, no views |
+| **ISP** | `MyHashMap`'s public surface is exactly the three methods asked for. `MyResizableHashMap` adds only `size` and `capacity`. No `entrySet`, no `keySet`, no views |
 | **DIP** | Nothing to invert — the map depends only on JDK primitives. Adding an interface for two classes that are never swapped at runtime would be abstraction for its own sake |
 
 ## Thread Safety
@@ -354,6 +448,12 @@ typically lose 50-100 of them:
 |---|---|
 | Lost node | Two threads prepend to one bucket, both read the old head, the second write erases the first's node |
 | Lost increment | If you add a `size` field, `size++` is read → add → write, and interleaved threads drop increments |
+
+**`MyResizableHashMap` is not thread safe either, and `resize` makes it worse.** Two threads can both
+cross the threshold and resize at once, each relinking the same nodes into its own new table, and one
+table wins. Java 7's `HashMap` prepended while relinking nodes during a resize, and concurrent resizes
+could link a chain into a **cycle** — a later `get` then looped forever. Java 8 keeps chain order,
+which removed the cycle but not the lost entries. Concurrent use needs `MyConcurrentHashMap`.
 
 **`MyConcurrentHashMap` is safe** for `put` / `get` / `remove` / `putIfAbsent`:
 
@@ -367,7 +467,7 @@ typically lose 50-100 of them:
 | Read path | No lock, no CAS, no retry — readers contend with nobody, which is why it beats a synchronized map on read-heavy loads |
 | Multi-step atomicity | `putIfAbsent` holds the check and the write under one lock — a caller cannot assemble it from `get` + `put` |
 
-**Out of scope on purpose:** no resize, so no cooperative resize to make concurrent (`ForwardingNode`,
+**Out of scope on purpose:** `MyConcurrentHashMap` has no resize, so no cooperative resize to make concurrent (`ForwardingNode`,
 `helpTransfer`). And the single `AtomicInteger` is the one remaining global contention point — the
 real JDK stripes it across `CounterCell`s and accepts a `size()` that is an estimate.
 
@@ -375,11 +475,14 @@ real JDK stripes it across `CounterCell`s and accepts a `size()` that is an esti
 
 | Change | How |
 |---|---|
-| More or fewer buckets | `BUCKETS` — one constant, and keep it prime |
+| More or fewer buckets | `MyHashMap`: `BUCKETS` — one constant, and keep it prime. `MyResizableHashMap`: `INITIAL_CAPACITY` |
 | Different hash | Rewrite `hash(int)`; every operation routes through it |
 | Negative keys | `Math.floorMod(key, BUCKETS)` — `%` alone returns a negative index |
-| Generic `<K, V>` | `hash` becomes `Math.floorMod(key.hashCode(), BUCKETS)`, and key comparison becomes `Objects.equals`. Cache the hash on the node so you can reject non-matches with an int compare before calling `equals`. Chaining and `remove` are unchanged |
-| Resizing | Add a `size` field, double the array past a 0.75 load factor, re-place every entry |
+| Generic `<K, V>` + resizing | Done — `MyResizableHashMap`. Chaining and `remove` are unchanged from `MyHashMap` |
+| Caller-chosen initial capacity | A constructor taking the expected size. Pre-sizing skips the early resizes when the size is known |
+| `containsKey` | Same chain walk as `get`, returning `true` on a match — needed once `null` can be a stored value, since `get` then can't tell "absent" from "stored null" |
+| Null keys | Bucket 0 for a `null` key, and compare with `Objects.equals` instead of `equals` |
+| Shrinking | Halve the table when `size < capacity * 0.25`. The gap between 0.25 and 0.75 is deliberate — shrink at 0.375 and a put/remove pair at the boundary would resize on every call |
 | Tree bins | Past 8 nodes in one bucket, swap the chain for a balanced tree — O(log n) worst case instead of O(n). ~400 lines that teach nothing about map design; describe it, don't write it |
 
 ## Common Interview Questions (Rapid Fire)
@@ -459,3 +562,32 @@ pass the check. Use `putIfAbsent`. **Thread safety does not compose.**
 The bucket is chosen from the key at insert time. Mutate a field the hash reads and the entry is now
 in the wrong bucket — `get` looks in the new bucket and never finds it. The entry is unreachable but
 still occupying memory.
+
+### Q17. When does `MyResizableHashMap` resize, exactly?
+When `size > capacity * 0.75` right after an insert. Starting at 16, the threshold is 12, so the **13th** put triggers
+16 → 32; then the 25th (→ 64), the 49th (→ 128). An overwrite doesn't change `size`, so it never resizes.
+
+### Q18. A resize is O(n). How is `put` still O(1)?
+Amortized. Doubling means each resize is paid for by the n puts since the last one: the total
+copying over n puts is n + n/2 + n/4 + … < 2n, so each put carries a constant share. Grow by a fixed
+amount instead (+16 buckets) and resizes come every 16 puts — O(n) per put.
+
+### Q19. Why can't entries stay where they are after a resize?
+The index is `key.hashCode() % capacity`. Change the capacity and the same hash can map to a different
+bucket. A node left in its old position is unreachable — `get` looks in the new bucket.
+
+### Q20. Why re-`put` every entry in `resize` instead of relinking the nodes?
+It's the version you can't get wrong on a whiteboard, and still O(n). It does allocate a new node per
+entry; the JDK avoids that by relinking existing nodes, and caches each key's hash on the node so it
+never calls `hashCode()` again. Mention both as optimisations.
+
+### Q21. What's the `hashCode` / `equals` contract, and what breaks without it?
+Equal objects **must** have equal hash codes. Override `equals` but not `hashCode` and two equal keys
+get different hashes — they land in different buckets, so `get` with an equal-but-different instance
+misses, and `put` stores a duplicate. The reverse (equal hashes, unequal objects) is just a collision,
+and chaining handles it.
+
+### Q22. Does it ever shrink?
+No, and neither does `java.util.HashMap` — removing everything leaves the big table. If asked: halve
+below 0.25 load. Keep that well apart from the 0.75 grow threshold so a put/remove pair at the boundary
+doesn't resize on every call.

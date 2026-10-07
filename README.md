@@ -21,7 +21,7 @@ This repo covers all the commonly asked Low Level Design questions for software 
 | 13 | Notification Service (multi-channel: Email / SMS / Push) | [`notification-service/`](notification-service/) |
 | 14 | Meeting Room Booking (interval overlap + allocation strategy) | [`meeting-room-booking/`](meeting-room-booking/) |
 | 15 | Task Scheduler (cron-like: priority queue + dispatcher + worker pool) | [`task-scheduler/`](task-scheduler/) |
-| 16 | HashMap (design it, then make it thread-safe in 3 changes) | [`hashmap/`](hashmap/) |
+| 16 | HashMap (design it, make it generic and resizable, then thread-safe in 3 changes) | [`hashmap/`](hashmap/) |
 
 ## Common Resources
 
